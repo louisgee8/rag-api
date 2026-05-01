@@ -1,0 +1,24 @@
+# --- Web framework ---
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+
+# --- Config / validation ---
+pydantic==2.9.2
+pydantic-settings==2.6.0
+
+# --- Database (Postgres + pgvector) ---
+psycopg[binary,pool]==3.2.3
+pgvector==0.3.6
+
+# --- Embeddings (local model) ---
+sentence-transformers==3.2.1
+
+# --- LLM provider ---
+anthropic==0.39.0
+
+# --- Document loaders ---
+pypdf==5.0.1
+python-multipart==0.0.12  # FastAPI file uploads
+
+# --- Dev / testing (kept light) ---
+httpx==0.27.2  # for /docs testing later

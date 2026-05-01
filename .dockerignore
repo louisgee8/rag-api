@@ -1,0 +1,25 @@
+# Don't ship local junk into the image.
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+.vscode/
+.idea/
+.DS_Store
+
+tests/
+*.md
+!README.md
+
+postgres_data/
+.cache/
+models/
+logs/
+*.log

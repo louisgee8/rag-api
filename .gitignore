@@ -1,0 +1,34 @@
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# --- Model cache (sentence-transformers downloads ~90MB to ~/.cache) ---
+.cache/
+models/
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Docker ---
+# (compose files ARE tracked; only ignore local volumes)
+postgres_data/
