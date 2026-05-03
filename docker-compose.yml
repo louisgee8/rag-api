@@ -1,0 +1,67 @@
+# Two services on a private bridge network.
+# - `db`  : Postgres 16 with pgvector pre-installed (pgvector/pgvector:pg16)
+# - `api` : FastAPI app, depends on db being healthy before it starts
+#
+# Only `api` exposes a port to the host. `db` is reachable ONLY from `api`
+# via the service name `db` on the internal `ragnet` network. That is
+# network segmentation as a literal config value.
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: rag-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      # Named volume = Postgres data persists across `docker compose down`
+      - postgres_data:/var/lib/postgresql/data
+      # Migrations folder mounted read-only. Postgres auto-runs any *.sql
+      # in /docker-entrypoint-initdb.d on FIRST boot only.
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    networks:
+      - ragnet
+    # NOTE: no `ports:` block on purpose. db is invisible from the host.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-api
+    restart: unless-stopped
+    environment:
+      API_KEY: ${API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
+      TOP_K: ${TOP_K}
+      CHUNK_SIZE: ${CHUNK_SIZE}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP}
+    ports:
+      - "8000:8000"   # host:container
+    depends_on:
+      db:
+        condition: service_healthy   # api waits until db healthcheck passes
+    networks:
+      - ragnet
+
+volumes:
+  postgres_data:
+
+networks:
+  ragnet:
+    driver: bridge
