@@ -9,6 +9,8 @@
 services:
   db:
     image: pgvector/pgvector:pg16
+    # Apple Silicon: pull the arm64 manifest, no QEMU emulation.
+    platform: linux/arm64
     container_name: rag-db
     restart: unless-stopped
     environment:
@@ -35,6 +37,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # Apple Silicon: build for arm64 natively. No emulation = ~5-10x faster builds.
+    platform: linux/arm64
     container_name: rag-api
     restart: unless-stopped
     environment:

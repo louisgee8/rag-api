@@ -24,8 +24,14 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Docker caches layers — if requirements.txt doesn't change, this whole
 # pip install layer is reused on every rebuild. Saves minutes.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# BuildKit cache mount: pip wheels persist across builds in a buildkit-managed
+# cache, NOT in the image. Layer is still cache-busted when requirements.txt
+# changes, but pip can reuse already-downloaded wheels = much faster reinstall.
+# Image stays slim (no /root/.cache/pip baked in) because the cache mount is
+# build-time only.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && \
+    pip install -r requirements.txt
 
 
 # =====================================================================
