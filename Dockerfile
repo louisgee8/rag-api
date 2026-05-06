@@ -56,6 +56,13 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # Copy only the app code. Owned by the non-root user.
 COPY --chown=app:app app/ ./app/
 
+# Pre-create the HuggingFace cache dir owned by `app`. Without this, the
+# non-root user can't mkdir under /app (which is root-owned from WORKDIR),
+# and sentence-transformers crashes on first model download.
+# HF_HOME tells transformers/sentence-transformers where to cache models.
+RUN mkdir -p /app/.cache/huggingface && chown -R app:app /app
+ENV HF_HOME=/app/.cache/huggingface
+
 USER app
 
 EXPOSE 8000

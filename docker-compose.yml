@@ -60,11 +60,17 @@ services:
     depends_on:
       db:
         condition: service_healthy   # api waits until db healthcheck passes
+    volumes:
+      # Named volume for the HuggingFace model cache (~90MB for MiniLM).
+      # Without this, every container rebuild re-downloads the model.
+      # Named volume (not bind mount) = host filesystem stays clean.
+      - hf_cache:/app/.cache
     networks:
       - ragnet
 
 volumes:
   postgres_data:
+  hf_cache:
 
 networks:
   ragnet:

@@ -32,3 +32,6 @@ logs/
 # --- Docker ---
 # (compose files ARE tracked; only ignore local volumes)
 postgres_data/
+
+# --- Test fixtures (generated artifacts) ---
+tests/fixtures/
