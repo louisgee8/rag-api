@@ -27,7 +27,7 @@ from app.auth import require_api_key
 app = FastAPI(
     title="rag-api",
     description="Retrieval-Augmented Generation API. Phase 1 MVP.",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 
