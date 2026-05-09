@@ -15,18 +15,19 @@ Routes:
 from typing import Any
 
 import anthropic
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app import ingest as ingest_lib
 from app import retrieval as retrieval_lib
 from app import synthesis as synthesis_lib
+from app.auth import require_api_key
 
 
 app = FastAPI(
     title="rag-api",
     description="Retrieval-Augmented Generation API. Phase 1 MVP.",
-    version="0.3.0",
+    version="0.4.0",
 )
 
 
@@ -94,7 +95,8 @@ def health() -> dict:
     return {"status": "ok", "service": "rag-api", "version": app.version}
 
 
-@app.post("/ingest", response_model=IngestResponse, tags=["ingest"])
+@app.post("/ingest", response_model=IngestResponse, tags=["ingest"],
+          dependencies=[Depends(require_api_key)])
 def ingest_text_endpoint(payload: IngestTextRequest) -> IngestResponse:
     """
     Ingest raw text via JSON body.
@@ -114,7 +116,8 @@ def ingest_text_endpoint(payload: IngestTextRequest) -> IngestResponse:
     )
 
 
-@app.post("/ingest/file", response_model=IngestResponse, tags=["ingest"])
+@app.post("/ingest/file", response_model=IngestResponse, tags=["ingest"],
+          dependencies=[Depends(require_api_key)])
 def ingest_file_endpoint(
     source: str = Form(..., min_length=1, max_length=512),
     file: UploadFile = File(...),
@@ -147,7 +150,8 @@ def ingest_file_endpoint(
     )
 
 
-@app.post("/query/retrieve", response_model=QueryRetrieveResponse, tags=["query"])
+@app.post("/query/retrieve", response_model=QueryRetrieveResponse, tags=["query"],
+          dependencies=[Depends(require_api_key)])
 def query_retrieve_endpoint(payload: QueryRequest) -> QueryRetrieveResponse:
     """
     Retrieve top-K chunks most similar to `question`. No LLM call.
@@ -178,7 +182,8 @@ def query_retrieve_endpoint(payload: QueryRequest) -> QueryRetrieveResponse:
     )
 
 
-@app.post("/query/answer", response_model=QueryAnswerResponse, tags=["query"])
+@app.post("/query/answer", response_model=QueryAnswerResponse, tags=["query"],
+          dependencies=[Depends(require_api_key)])
 def query_answer_endpoint(payload: QueryRequest) -> QueryAnswerResponse:
     """
     Retrieve top-K chunks AND synthesize an answer via Anthropic.
