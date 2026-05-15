@@ -53,8 +53,13 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Copy only the app code. Owned by the non-root user.
+# Copy only the app code + admin scripts. Owned by the non-root user.
+# scripts/ is included so admin CLIs (e.g. scripts/issue_key.py) can run via
+# `docker compose exec api python -m scripts.issue_key`. Tests/ and migrations/
+# are deliberately NOT included — tests run from the host, migrations are
+# bind-mounted into the db container.
 COPY --chown=app:app app/ ./app/
+COPY --chown=app:app scripts/ ./scripts/
 
 # Pre-create the HuggingFace cache dir owned by `app`. Without this, the
 # non-root user can't mkdir under /app (which is root-owned from WORKDIR),

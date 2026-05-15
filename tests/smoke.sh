@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 #
-# tests/smoke.sh — End-to-end smoke test for rag-api Phase 1.
+# tests/smoke.sh — End-to-end smoke test for rag-api (Phase 1 + Phase 2 Step 1).
 #
-# Exercises the full happy + auth-failure paths against a running stack:
-#   1. /health is public (no auth)
-#   2. Protected route without auth → 401
-#   3. Protected route with empty Bearer token → 401
-#   4. Protected route with wrong key → 401
-#   5. /ingest with correct key → 200, chunks created
-#   6. /query/retrieve returns the freshly ingested doc as top result
-#   7. (optional) /query/answer end-to-end via real Anthropic call
+# Coverage:
+#   Phase 1 baseline:
+#     1. /health public, version reflects new code
+#     2. Protected route without auth        → 401
+#     3. Protected route with empty Bearer   → 401
+#     4. Protected route with bogus key      → 401
+#     5. /ingest with valid key              → 200
+#     6. /query/retrieve top result correct  → 200
+#     7. (optional) /query/answer real call  → 200
+#   Phase 2 Step 1 additions:
+#     8. Revoke key via CLI                  → CLI exit 0
+#     9. /ingest with revoked key            → 401
 #
 # Usage:
 #   ./tests/smoke.sh                          # default: skip Anthropic call
@@ -18,18 +22,18 @@
 #
 # Exit codes:
 #   0 = all assertions passed
-#   1 = at least one assertion failed (or .env missing / API_KEY unset)
+#   1 = at least one assertion failed (or stack not reachable)
 #
-# Requires: bash, curl, python3 (stdlib only — for JSON parsing)
-# Re-run safe: ingestion uses a fixed source name and DELETE-by-source
-# semantics, so re-running the smoke does not pollute the documents table.
+# Requires: bash, curl, python3 (stdlib only), docker compose CLI
+# Re-run safe: each run mints a fresh per-tenant key and revokes it at the
+# end. The smoke-test tenant accumulates revoked rows over time, which is
+# the correct audit-trail behavior.
 
-set -u  # Undefined-var = error. We deliberately do NOT set -e because we
-        # want to handle expected curl non-zero exits gracefully.
+set -u
 
 API_URL="${API_URL:-http://localhost:8000}"
-ENV_FILE="${ENV_FILE:-.env}"
 SMOKE_SOURCE="smoke-test-fixture"
+SMOKE_TENANT="smoke-test"
 
 # Color codes (graceful fallback if not a TTY)
 if [[ -t 1 ]]; then
@@ -41,36 +45,43 @@ fi
 PASS=0
 FAIL=0
 
-pass() { echo -e "${GREEN}PASS${NC} $*"; PASS=$((PASS + 1)); }
-fail() { echo -e "${RED}FAIL${NC} $*"; FAIL=$((FAIL + 1)); }
-skip() { echo -e "${YELLOW}SKIP${NC} $*"; }
+pass() { printf "%b\n" "${GREEN}PASS${NC} $*"; PASS=$((PASS + 1)); }
+fail() { printf "%b\n" "${RED}FAIL${NC} $*"; FAIL=$((FAIL + 1)); }
+skip() { printf "%b\n" "${YELLOW}SKIP${NC} $*"; }
 
 # ----------------------------------------------------------------------------
-# Load API_KEY from .env
+# Setup: mint a fresh API key via the admin CLI.
+#
+# `docker compose exec -T` disables pseudo-TTY so the banner output is
+# clean ASCII parseable by grep/awk. Without -T, control chars sneak in.
 # ----------------------------------------------------------------------------
-if [[ ! -f "$ENV_FILE" ]]; then
-    fail "No .env file at $ENV_FILE — cannot load API_KEY."
-    exit 1
-fi
-
-API_KEY=$(grep '^API_KEY=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
-if [[ -z "$API_KEY" ]]; then
-    fail "API_KEY not set in $ENV_FILE (no API_KEY= line, or empty value)."
-    exit 1
-fi
-if [[ "$API_KEY" == "replace-me-with-openssl-rand-hex-32" ]]; then
-    fail "API_KEY in $ENV_FILE is the placeholder. Generate a real one: openssl rand -hex 32"
-    exit 1
-fi
-
-echo "rag-api Phase 1 smoke test"
+echo "rag-api Phase 2 smoke test"
 echo "  API URL:  $API_URL"
-echo "  API_KEY:  ${API_KEY:0:8}... (loaded from $ENV_FILE)"
-echo "  Anthropic: $([[ "${SMOKE_TEST_ANTHROPIC:-0}" == "1" ]] && echo "enabled" || echo "skipped (set SMOKE_TEST_ANTHROPIC=1 to enable)")"
+echo "  Tenant:   $SMOKE_TENANT"
+echo "----------------------------------------"
+echo "Minting fresh key via scripts/issue_key.py ..."
+
+ISSUE_OUTPUT=$(docker compose exec -T api python -m scripts.issue_key --tenant "$SMOKE_TENANT" 2>&1)
+if [[ $? -ne 0 ]]; then
+    fail "Could not mint key. Is the api container running?"
+    echo "$ISSUE_OUTPUT"
+    exit 1
+fi
+
+# Parse "  token      : rk_..." and "  key_prefix : rk_..." out of the banner.
+TOKEN=$(echo "$ISSUE_OUTPUT" | grep -E '^[[:space:]]*token[[:space:]]*:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+KEY_PREFIX=$(echo "$ISSUE_OUTPUT" | grep -E '^[[:space:]]*key_prefix[[:space:]]*:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+
+if [[ -z "$TOKEN" || -z "$KEY_PREFIX" ]]; then
+    fail "Could not parse token/key_prefix from issue_key output:"
+    echo "$ISSUE_OUTPUT"
+    exit 1
+fi
+echo "  Minted key_prefix=$KEY_PREFIX (token captured, not echoed)"
 echo "----------------------------------------"
 
 # ----------------------------------------------------------------------------
-# Test 1: /health is public, no auth needed
+# Test 1: /health is public, no auth needed. Version surfaces in payload.
 # ----------------------------------------------------------------------------
 HTTP=$(curl -s -o /tmp/smoke_health.json -w "%{http_code}" "$API_URL/health")
 if [[ "$HTTP" == "200" ]] && grep -q '"status":"ok"' /tmp/smoke_health.json; then
@@ -94,7 +105,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Test 3: Empty Bearer token → 401 (closes Session 6 coverage gap)
+# Test 3: Empty Bearer token → 401
 # ----------------------------------------------------------------------------
 HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
     -X POST "$API_URL/query/retrieve" \
@@ -108,64 +119,53 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Test 4: Wrong key → 401
+# Test 4: Bogus key → 401 (cannot exist in api_keys table)
 # ----------------------------------------------------------------------------
 HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
     -X POST "$API_URL/query/retrieve" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer this-is-not-the-real-key" \
+    -H "Authorization: Bearer rk_definitely_not_a_real_key" \
     -d '{"question":"test"}')
 if [[ "$HTTP" == "401" ]]; then
-    pass "POST /query/retrieve (wrong key) → 401"
+    pass "POST /query/retrieve (bogus key) → 401"
 else
-    fail "POST /query/retrieve wrong-key expected 401, got $HTTP"
+    fail "POST /query/retrieve bogus-key expected 401, got $HTTP"
 fi
 
 # ----------------------------------------------------------------------------
-# Test 5: /ingest with correct key → 200
+# Test 5: /ingest with the minted key → 200
 # ----------------------------------------------------------------------------
 SMOKE_TEXT="The Apollo 11 mission landed on the Moon on July 20, 1969. Neil Armstrong was the first human to walk on the lunar surface, followed by Buzz Aldrin. Michael Collins remained in lunar orbit aboard the command module Columbia."
 
 HTTP=$(curl -s -o /tmp/smoke_ingest.json -w "%{http_code}" \
     -X POST "$API_URL/ingest" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $API_KEY" \
+    -H "Authorization: Bearer $TOKEN" \
     -d "{\"source\":\"$SMOKE_SOURCE\",\"text\":\"$SMOKE_TEXT\"}")
 if [[ "$HTTP" == "200" ]]; then
     CHUNKS=$(python3 -c "import json; print(json.load(open('/tmp/smoke_ingest.json'))['chunks_created'])")
-    REPLACED=$(python3 -c "import json; print(json.load(open('/tmp/smoke_ingest.json'))['chunks_replaced'])")
-    pass "POST /ingest (correct key) → 200, chunks_created=$CHUNKS replaced=$REPLACED"
+    pass "POST /ingest (valid key, tenant=$SMOKE_TENANT) → 200, chunks_created=$CHUNKS"
 else
     fail "POST /ingest expected 200, got $HTTP: $(cat /tmp/smoke_ingest.json)"
-    echo "----------------------------------------"
     echo "Cannot continue — /ingest must succeed for retrieval test."
     echo "Results: $PASS passed, $FAIL failed"
     exit 1
 fi
 
 # ----------------------------------------------------------------------------
-# Test 6: /query/retrieve — top result must be from our fixture
+# Test 6: /query/retrieve — top result must be our fixture
 # ----------------------------------------------------------------------------
 HTTP=$(curl -s -o /tmp/smoke_query.json -w "%{http_code}" \
     -X POST "$API_URL/query/retrieve" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $API_KEY" \
+    -H "Authorization: Bearer $TOKEN" \
     -d '{"question":"Who was the first person to walk on the Moon?","top_k":3}')
-
 if [[ "$HTTP" != "200" ]]; then
     fail "POST /query/retrieve expected 200, got $HTTP: $(cat /tmp/smoke_query.json)"
 else
-    TOP_SOURCE=$(python3 -c "
-import json
-d = json.load(open('/tmp/smoke_query.json'))
-print(d['chunks'][0]['source'] if d['chunks'] else 'EMPTY')
-")
+    TOP_SOURCE=$(python3 -c "import json; d=json.load(open('/tmp/smoke_query.json')); print(d['chunks'][0]['source'] if d['chunks'] else 'EMPTY')")
     if [[ "$TOP_SOURCE" == "$SMOKE_SOURCE" ]]; then
-        TOP_DIST=$(python3 -c "
-import json
-d = json.load(open('/tmp/smoke_query.json'))
-print(f\"{d['chunks'][0]['distance']:.4f}\")
-")
+        TOP_DIST=$(python3 -c "import json; d=json.load(open('/tmp/smoke_query.json')); print(f\"{d['chunks'][0]['distance']:.4f}\")")
         pass "POST /query/retrieve top result is $SMOKE_SOURCE (cosine distance=$TOP_DIST)"
     else
         fail "POST /query/retrieve top result expected $SMOKE_SOURCE, got '$TOP_SOURCE'"
@@ -179,14 +179,10 @@ if [[ "${SMOKE_TEST_ANTHROPIC:-0}" == "1" ]]; then
     HTTP=$(curl -s -o /tmp/smoke_answer.json -w "%{http_code}" \
         -X POST "$API_URL/query/answer" \
         -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $API_KEY" \
+        -H "Authorization: Bearer $TOKEN" \
         -d '{"question":"Who was the first person to walk on the Moon?"}')
     if [[ "$HTTP" == "200" ]]; then
-        SUMMARY=$(python3 -c "
-import json
-d = json.load(open('/tmp/smoke_answer.json'))
-print(f\"model={d['model']}, in={d['input_tokens']}t, out={d['output_tokens']}t, ans_len={len(d['answer'])}c\")
-")
+        SUMMARY=$(python3 -c "import json; d=json.load(open('/tmp/smoke_answer.json')); print(f\"model={d['model']}, in={d['input_tokens']}t, out={d['output_tokens']}t, ans_len={len(d['answer'])}c\")")
         pass "POST /query/answer (real Anthropic call) → 200, $SUMMARY"
     else
         fail "POST /query/answer expected 200, got $HTTP: $(cat /tmp/smoke_answer.json)"
@@ -196,12 +192,40 @@ else
 fi
 
 # ----------------------------------------------------------------------------
+# Test 8 (Phase 2): Revoke the smoke key via CLI.
+# ----------------------------------------------------------------------------
+REVOKE_OUTPUT=$(docker compose exec -T api python -m scripts.issue_key \
+    --tenant "$SMOKE_TENANT" --revoke "$KEY_PREFIX" 2>&1)
+if [[ $? -eq 0 ]] && echo "$REVOKE_OUTPUT" | grep -q "Revoked key_id="; then
+    pass "scripts/issue_key.py --revoke $KEY_PREFIX → CLI exit 0"
+else
+    fail "Revoke CLI failed: $REVOKE_OUTPUT"
+fi
+
+# ----------------------------------------------------------------------------
+# Test 9 (Phase 2): Revoked key should now 401 on a protected route.
+# Same key, same wire format — only the DB row state changed.
+# ----------------------------------------------------------------------------
+HTTP=$(curl -s -o /tmp/smoke_revoked.json -w "%{http_code}" \
+    -X POST "$API_URL/ingest" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN" \
+    -d '{"source":"after-revoke","text":"should not land"}')
+if [[ "$HTTP" == "401" ]]; then
+    DETAIL=$(python3 -c "import json; print(json.load(open('/tmp/smoke_revoked.json'))['detail'])" 2>/dev/null || echo "?")
+    pass "POST /ingest with revoked key → 401 (detail: $DETAIL)"
+else
+    fail "POST /ingest revoked-key expected 401, got $HTTP: $(cat /tmp/smoke_revoked.json)"
+fi
+
+# ----------------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------------
 echo "----------------------------------------"
-echo -e "Results: ${GREEN}${PASS} passed${NC}, $([[ $FAIL -gt 0 ]] && echo -e "${RED}${FAIL} failed${NC}" || echo "0 failed")"
-
-if [[ "$FAIL" -gt 0 ]]; then
+if [[ $FAIL -gt 0 ]]; then
+    printf "%b\n" "Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}"
     exit 1
+else
+    printf "%b\n" "Results: ${GREEN}${PASS} passed${NC}, 0 failed"
+    exit 0
 fi
-exit 0

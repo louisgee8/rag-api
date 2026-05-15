@@ -1,81 +1,85 @@
 """
-Bearer-token authentication for protected routes.
+Per-tenant Bearer-token authentication (Phase 2 Step 1).
 
-Single shared API key model (Phase 1). The key is read from the API_KEY
-environment variable at request time and compared to the value provided by
-the client in the `Authorization: Bearer <key>` header.
+Replaces the Phase 1 single-shared-key model. Each tenant has one or
+more rows in the `api_keys` table; the bearer token presented in the
+`Authorization` header is hashed and looked up against `key_hash`.
 
-Why this design:
-- Single shared key is appropriate for a single-tenant Phase 1 deployment.
-  Phase 2 (multi-tenant) would swap this for per-tenant keys in a table.
-- Reading from env at request time (not import time) means the server can
-  be reconfigured without a code-path change. It also means a missing key
-  fails CLOSED (server returns 500), not OPEN.
-- `Authorization: Bearer <token>` is RFC 6750 standard, plays nicely with
-  API gateways, reverse proxies, and tooling that already understands the
-  Bearer scheme (JWT, OAuth2, etc).
-- `secrets.compare_digest()` is a constant-time byte comparison. Plain `==`
-  short-circuits on the first mismatched byte, so total comparison time
-  leaks how many leading bytes of the candidate key were correct. With
-  enough samples and low network jitter, an attacker can recover the key
-  one byte at a time. compare_digest closes that side channel.
+Request flow:
+    1. Extract `Authorization: Bearer <token>` from request headers.
+    2. SHA-256 the token -> digest.
+    3. SELECT tenant_id, key_prefix, revoked_at FROM api_keys
+       WHERE key_hash = <digest> LIMIT 1.
+    4. No row     -> 401 (invalid key)
+       revoked    -> 401 (revoked key)
+       active row -> return TenantIdentity for downstream consumers.
 
-Failure modes (all return 401 to the client, generic message):
-- Missing `Authorization` header
-- Malformed header (no scheme, scheme without value, wrong scheme)
-- Wrong key (correct shape, wrong bytes)
+Failure modes:
+    - DB unreachable        -> 500 (fail closed; we cannot authenticate
+                                    anyone if the auth store is down)
+    - Missing/malformed hdr -> 401 (same as Phase 1)
+    - Wrong/revoked token   -> 401 (generic message; no leak about WHICH
+                                    failure mode triggered)
 
-Server misconfiguration (API_KEY env unset or empty) returns 500. Never
-trust a server that can't tell you what its own key is supposed to be.
+What this module deliberately does NOT do:
+    - Cache the lookup. Phase 2 throughput is small; a DB hit per request
+      is fine. Caching would have to handle revocation invalidation, which
+      is a Step 6+ concern. KISS.
+    - Update a `last_used_at` column. Same Step 6 deferral — audit
+      logging will land per-request timestamps in a structured log,
+      not by mutating the auth row on every read.
+
+Wire-format compatibility:
+    - The HTTP layer is unchanged. Clients still send
+      `Authorization: Bearer <token>`. Only the server-side validation
+      changed. This means existing curl scripts / API clients keep
+      working as long as they swap their token value.
 """
 
 from __future__ import annotations
 
-import os
-import secrets
+from dataclasses import dataclass
 
 from fastapi import Header, HTTPException, status
+from psycopg import OperationalError
+
+from app.db import get_conn
+from app.security.keys import extract_prefix, hash_token
 
 
-def require_api_key(
-    authorization: str | None = Header(default=None),
-) -> str:
+@dataclass(frozen=True)
+class TenantIdentity:
+    """Resolved identity of the caller for the current request.
+
+    Returned by `verify_api_key` for handlers that need to know WHO is
+    calling. Will feed Step 2 (per-key rate limiting) and Step 6
+    (audit log key/tenant tagging).
     """
-    FastAPI dependency that enforces a valid Bearer token.
+    key_id: int        # api_keys.id — stable PK for joins to audit_log
+    tenant_id: str     # caller-facing identity, e.g. "acme-corp"
+    key_prefix: str    # rk_<8 chars> — log-safe identifier of the key
 
-    Wire it onto a route with `Depends(require_api_key)`. On success the
-    validated key string is returned (handy if a future route wants to log
-    or rate-limit per-key). On any failure path, an HTTPException is
-    raised and FastAPI converts it into a JSON error response.
 
-    Returns:
-        The validated bearer token (same value as the env API_KEY).
-
-    Raises:
-        HTTPException 500: API_KEY env var is missing or empty (server
-            misconfiguration — fail closed).
-        HTTPException 401: Authorization header missing, malformed,
-            wrong scheme, or wrong key.
+def _parse_bearer(authorization: str | None) -> str:
     """
-    expected_key = os.getenv("API_KEY")
-    if not expected_key:
-        # Fail closed. Server has no configured key, so it cannot
-        # authenticate anyone. Refuse rather than accept blindly.
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server misconfigured: API_KEY not set.",
-        )
+    Pull the token bytes out of an `Authorization: Bearer <token>` header.
 
+    Raises 401 (with WWW-Authenticate: Bearer) on:
+    - Missing header
+    - Header that doesn't split into [scheme, value]
+    - Scheme != "bearer" (case-insensitive)
+    - Empty token after the scheme
+
+    Same parser as Phase 1 — wire format is unchanged, only the
+    validation logic past this point is different.
+    """
     if authorization is None:
-        # No header at all.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing Authorization header.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Parse "Bearer <token>" — split on first whitespace only so tokens
-    # containing spaces (unusual but legal) are not mangled.
     parts = authorization.split(" ", 1)
     if len(parts) != 2:
         raise HTTPException(
@@ -92,14 +96,86 @@ def require_api_key(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Constant-time compare. encode() to bytes so equal-length unicode
-    # surrogate edge cases don't matter; compare_digest accepts both
-    # str and bytes, but bytes is the unambiguous form.
-    if not secrets.compare_digest(token.encode("utf-8"), expected_key.encode("utf-8")):
+    return token
+
+
+def verify_api_key(
+    authorization: str | None = Header(default=None),
+) -> TenantIdentity:
+    """
+    FastAPI dependency: enforce a valid, active per-tenant bearer token.
+
+    Wire onto a route either way:
+        # Side-effect only (most current handlers):
+        @app.post("/ingest", dependencies=[Depends(verify_api_key)])
+        def ingest(...): ...
+
+        # Need tenant identity downstream (Step 2+ handlers):
+        @app.post("/ingest")
+        def ingest(..., tenant: TenantIdentity = Depends(verify_api_key)):
+            log.info("ingest from", tenant_id=tenant.tenant_id)
+
+    Returns:
+        TenantIdentity if the token resolves to an active key row.
+
+    Raises:
+        HTTPException 401: missing/malformed header, unknown token,
+            or token belongs to a revoked key. Generic message — we
+            deliberately do not distinguish "no such key" from
+            "revoked" so an attacker cannot probe which prefix bytes
+            were ever issued.
+        HTTPException 500: Postgres unreachable. Fail closed — we
+            cannot authenticate anyone if the auth store is down.
+    """
+    token = _parse_bearer(authorization)
+    digest = hash_token(token)
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, tenant_id, key_prefix, revoked_at
+                      FROM api_keys
+                     WHERE key_hash = %s
+                     LIMIT 1
+                    """,
+                    (digest,),
+                )
+                row = cur.fetchone()
+    except OperationalError as e:
+        # Database is down or unreachable. We cannot prove or disprove
+        # the caller's identity, so we MUST refuse rather than guess.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Auth store unavailable: {e.__class__.__name__}",
+        )
+
+    if row is None:
+        # No row matched the digest. Either the token is bogus or
+        # was hashed differently. Log only the prefix of the attempt —
+        # never the full token — so a log leak doesn't compound
+        # the breach we're already investigating.
+        _ = extract_prefix(token)  # placeholder; Step 6 audit log will use this
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    return token
+    key_id, tenant_id, key_prefix, revoked_at = row
+
+    if revoked_at is not None:
+        # Key was active at some point but has since been revoked.
+        # Same generic 401 message as "unknown key" — see docstring.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return TenantIdentity(
+        key_id=key_id,
+        tenant_id=tenant_id,
+        key_prefix=key_prefix,
+    )

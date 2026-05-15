@@ -2,7 +2,7 @@
 
 A Retrieval-Augmented Generation (RAG) API built with FastAPI, Postgres + pgvector, sentence-transformers, and Anthropic's Claude.
 
-**Status:** Phase 1 (MVP) complete.
+**Status:** Phase 2 Step 1 shipped — per-tenant API keys replace the Phase 1 shared bearer token.
 
 ## What it does
 
@@ -17,19 +17,21 @@ Ingests documents (text or PDF), chunks and embeds them into a Postgres vector d
 | Vector DB | Postgres 16 + pgvector with HNSW cosine index |
 | LLM | Anthropic Claude (claude-sonnet-4-5 by default) |
 | Container | Docker Compose, native ARM64 on Apple Silicon |
-| Auth | Bearer token, constant-time compare via `secrets.compare_digest()` |
+| Auth | Per-tenant bearer keys: SHA-256 hashed in `api_keys` table, indexed lookup, soft-delete revocation |
 
 ## Quick start
 
 ```bash
 cp .env.example .env
-# Generate a real API key:
-openssl rand -hex 32  # paste into API_KEY=
 # Add your Anthropic key (only needed for /query/answer):
 # ANTHROPIC_API_KEY=sk-ant-api03-...
 
 docker compose up --build -d
 curl http://localhost:8000/health
+
+# Mint a per-tenant key (Phase 2):
+docker compose exec api python -m scripts.issue_key --tenant my-tenant
+# Copy the printed `token: rk_...` value — it cannot be recovered.
 ```
 
 ## Endpoints
@@ -78,9 +80,21 @@ SMOKE_TEST_ANTHROPIC=1 ./tests/smoke.sh
 
 The script is idempotent. It uses a fixed source name (`smoke-test-fixture`) and the API's DELETE-by-source re-ingest semantics, so re-running does not pollute the documents table.
 
-## Security notes (Phase 1)
+## Security posture
 
-- Single shared API key, validated with `secrets.compare_digest()` for constant-time comparison (defeats timing side channels).
+### Phase 2 Step 1 — Per-tenant API keys (Sec+ domain: IAM, least privilege)
+
+- Bearer tokens are 256-bit URL-safe random (`secrets.token_urlsafe(32)`) with an `rk_` brand prefix for secret-scanner matching (GitHub, TruffleHog, gitleaks pattern).
+- Tokens are stored as SHA-256 hex digests in the `api_keys` table. A DB breach yields unusable digests, not live tokens.
+- Lookup is `WHERE key_hash = $1` against a UNIQUE btree index — O(log n) and side-channel free.
+- Revocation is soft-delete via `revoked_at` timestamp. Audit-log entries that reference a revoked key still resolve.
+- Both "unknown key" and "revoked key" return the same generic `401 "Invalid API key."` message — defeats key-enumeration probing.
+- `key_prefix` (first 11 chars of the cleartext) is the only log-safe identifier. Never log the cleartext token or the digest.
+- Admin CLI: `docker compose exec api python -m scripts.issue_key --tenant <id> [--revoke <prefix>] [--list-tenant]`.
+
+### Phase 1 baseline
+
+- `Authorization: Bearer <key>` per RFC 6750. Never accept the key in URL params (URL params leak via access logs, browser history, Referer headers).
 - `Authorization: Bearer <key>` per RFC 6750. Never accept the key in URL params (URL params leak via access logs, browser history, Referer headers).
 - Server fails closed if `API_KEY` env is unset (returns 500, never bypasses auth).
 - `/health` is intentionally unauthenticated so the Docker `HEALTHCHECK` works without baking the secret into the container.
@@ -90,9 +104,15 @@ The script is idempotent. It uses a fixed source name (`smoke-test-fixture`) and
 - Bounded payloads: 10MB hard cap on file uploads, 2000 char cap on questions, 512 char cap on source IDs.
 - MIME allowlist on file ingest (text/plain, application/pdf only). Never trusts file extension.
 
-## What Phase 2 will add
+## Phase 2 roadmap
 
-Rate limiting, prompt injection defense (input sanitization + system prompt hardening), PII redaction, structured audit logging, per-tenant API keys, and a relevance threshold for "I don't know" responses.
+- [x] **Step 1**: Per-tenant API keys (this release).
+- [ ] Step 2: Rate limiting per key.
+- [ ] Step 3: PII redaction on `/ingest`.
+- [ ] Step 4: Prompt injection defense.
+- [ ] Step 5: Relevance threshold for "I don't know" responses.
+- [ ] Step 6: Structured audit logging.
+- [ ] Step 7: CI/CD via GitHub Actions.
 
 ## License
 
