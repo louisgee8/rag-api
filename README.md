@@ -2,7 +2,7 @@
 
 A Retrieval-Augmented Generation (RAG) API built with FastAPI, Postgres + pgvector, sentence-transformers, and Anthropic's Claude.
 
-**Status:** Phase 2 Step 1 shipped — per-tenant API keys replace the Phase 1 shared bearer token.
+**Status:** Phase 2 Step 2 shipped — per-key rate limiting on top of per-tenant API keys.
 
 ## What it does
 
@@ -18,6 +18,7 @@ Ingests documents (text or PDF), chunks and embeds them into a Postgres vector d
 | LLM | Anthropic Claude (claude-sonnet-4-5 by default) |
 | Container | Docker Compose, native ARM64 on Apple Silicon |
 | Auth | Per-tenant bearer keys: SHA-256 hashed in `api_keys` table, indexed lookup, soft-delete revocation |
+| Rate limit | In-memory fixed-window counter, per `key_id`, env-tunable (default 60 req / 60 s) |
 
 ## Quick start
 
@@ -82,6 +83,20 @@ The script is idempotent. It uses a fixed source name (`smoke-test-fixture`) and
 
 ## Security posture
 
+### Phase 2 Step 2 — Per-key rate limiting (Sec+ domain: Availability / DoS, IAM abuse containment)
+
+- Fixed-window counter, in-memory, keyed by `api_keys.id`. Default: `RATE_LIMIT_REQUESTS=60` requests per `RATE_LIMIT_WINDOW_SECONDS=60` seconds, both env-tunable.
+- Lives in `app/security/ratelimit.py` as a FastAPI dependency (`enforce_rate_limit`) that wraps `verify_api_key`. The dep chain is auth → rate check → handler; an unauthenticated request never consumes a slot.
+- 429 responses include `Retry-After: <seconds-until-window-end>` per RFC 9110 §10.2.3.
+- Thread-safety: dict mutation is serialized with `threading.Lock`. FastAPI sync handlers run in a worker thread pool, so this is the correct primitive for our concurrency model. The lock prevents a TOCTOU race where two simultaneous requests both read `count=59` and both increment to 60 — i.e. the limit becomes meaningless under load.
+- Clock source is `time.monotonic()`, not wall clock. Window math survives NTP correction and DST shifts.
+
+**Known limitations (intentional, documented for Phase 3 swap):**
+
+1. **In-memory state** — counters reset on container restart and are not shared across replicas. Single-container portfolio deploy is fine; horizontal scale is not. Phase 3 swaps to Redis.
+2. **Boundary burst** — a fixed-window limiter can let a client fire up to 2x the stated limit across a window edge (e.g. burst at `:59.5` + burst at `:00.5`). Sliding window or token bucket fixes this; deferred to Phase 3.
+3. **Unbounded bucket dict** — one entry per unique `key_id` seen, never reaped. For portfolio scope this is bounded by the number of issued keys. Phase 3 adds LRU eviction.
+
 ### Phase 2 Step 1 — Per-tenant API keys (Sec+ domain: IAM, least privilege)
 
 - Bearer tokens are 256-bit URL-safe random (`secrets.token_urlsafe(32)`) with an `rk_` brand prefix for secret-scanner matching (GitHub, TruffleHog, gitleaks pattern).
@@ -106,8 +121,8 @@ The script is idempotent. It uses a fixed source name (`smoke-test-fixture`) and
 
 ## Phase 2 roadmap
 
-- [x] **Step 1**: Per-tenant API keys (this release).
-- [ ] Step 2: Rate limiting per key.
+- [x] **Step 1**: Per-tenant API keys.
+- [x] **Step 2**: Per-key rate limiting (this release).
 - [ ] Step 3: PII redaction on `/ingest`.
 - [ ] Step 4: Prompt injection defense.
 - [ ] Step 5: Relevance threshold for "I don't know" responses.

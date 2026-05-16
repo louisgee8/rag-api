@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# tests/smoke.sh — End-to-end smoke test for rag-api (Phase 1 + Phase 2 Step 1).
+# tests/smoke.sh — End-to-end smoke test for rag-api (Phase 1 + Phase 2 Steps 1-2).
 #
 # Coverage:
 #   Phase 1 baseline:
@@ -14,6 +14,9 @@
 #   Phase 2 Step 1 additions:
 #     8. Revoke key via CLI                  → CLI exit 0
 #     9. /ingest with revoked key            → 401
+#   Phase 2 Step 2 additions:
+#    10. Burst N+1 reqs vs RATE_LIMIT        → exactly N×200 + 1×429
+#    11. 429 response carries Retry-After    → header > 0
 #
 # Usage:
 #   ./tests/smoke.sh                          # default: skip Anthropic call
@@ -216,6 +219,80 @@ if [[ "$HTTP" == "401" ]]; then
     pass "POST /ingest with revoked key → 401 (detail: $DETAIL)"
 else
     fail "POST /ingest revoked-key expected 401, got $HTTP: $(cat /tmp/smoke_revoked.json)"
+fi
+
+# ----------------------------------------------------------------------------
+# Test 10 (Phase 2 Step 2): Burst test against /query/retrieve.
+#
+# The original smoke key was revoked above, so we mint a separate key under
+# tenant=smoke-ratelimit that starts with a clean rate-limit budget.
+#
+# Strategy:
+#   - Read RATE_LIMIT_REQUESTS from .env (fall back to 10 if absent).
+#   - Fire N+1 requests in a tight loop, capturing each HTTP code.
+#   - Expect exactly N × 200 and exactly 1 × 429.
+#   - The first 429 will be on request N+1 (request index == limit + 1).
+# ----------------------------------------------------------------------------
+RATELIMIT_TENANT="smoke-ratelimit"
+
+# Read RATE_LIMIT_REQUESTS from .env without touching the running shell env.
+# Default to 10 (matching .env's local-dev value) if not present.
+RATE_LIMIT=$(grep -E '^RATE_LIMIT_REQUESTS=' .env 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d '[:space:]')
+RATE_LIMIT=${RATE_LIMIT:-10}
+
+echo "----------------------------------------"
+echo "Minting fresh key for rate-limit test (tenant=$RATELIMIT_TENANT, limit=$RATE_LIMIT) ..."
+RL_ISSUE_OUTPUT=$(docker compose exec -T api python -m scripts.issue_key --tenant "$RATELIMIT_TENANT" 2>&1)
+if [[ $? -ne 0 ]]; then
+    fail "Could not mint rate-limit-test key: $RL_ISSUE_OUTPUT"
+else
+    RL_TOKEN=$(echo "$RL_ISSUE_OUTPUT" | grep -E '^[[:space:]]*token[[:space:]]*:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    RL_PREFIX=$(echo "$RL_ISSUE_OUTPUT" | grep -E '^[[:space:]]*key_prefix[[:space:]]*:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+
+    # Tally results across the burst.
+    BURST_TOTAL=$((RATE_LIMIT + 1))
+    OK_COUNT=0
+    LIMITED_COUNT=0
+    OTHER_COUNT=0
+    RETRY_AFTER=""
+
+    for i in $(seq 1 $BURST_TOTAL); do
+        # Capture both headers and status code.
+        HTTP=$(curl -s -o /dev/null -D /tmp/smoke_burst_headers.txt -w "%{http_code}" \
+            -X POST "$API_URL/query/retrieve" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RL_TOKEN" \
+            -d '{"question":"burst test","top_k":1}')
+        case "$HTTP" in
+            200) OK_COUNT=$((OK_COUNT + 1)) ;;
+            429)
+                LIMITED_COUNT=$((LIMITED_COUNT + 1))
+                # Grab the Retry-After header from the FIRST 429 we see.
+                if [[ -z "$RETRY_AFTER" ]]; then
+                    RETRY_AFTER=$(grep -i '^retry-after:' /tmp/smoke_burst_headers.txt | head -1 | awk -F': ' '{print $2}' | tr -d '\r\n[:space:]')
+                fi
+                ;;
+            *) OTHER_COUNT=$((OTHER_COUNT + 1)) ;;
+        esac
+    done
+
+    # Assertion 1: exactly N × 200 and exactly 1 × 429.
+    if [[ "$OK_COUNT" -eq "$RATE_LIMIT" && "$LIMITED_COUNT" -eq 1 && "$OTHER_COUNT" -eq 0 ]]; then
+        pass "Burst $BURST_TOTAL reqs → $OK_COUNT × 200, $LIMITED_COUNT × 429 (limit honored)"
+    else
+        fail "Burst $BURST_TOTAL reqs → $OK_COUNT × 200, $LIMITED_COUNT × 429, $OTHER_COUNT × other (expected $RATE_LIMIT/1/0)"
+    fi
+
+    # Assertion 2: Retry-After is present and > 0.
+    if [[ -n "$RETRY_AFTER" && "$RETRY_AFTER" =~ ^[0-9]+$ && "$RETRY_AFTER" -gt 0 ]]; then
+        pass "429 response carries Retry-After: ${RETRY_AFTER}s"
+    else
+        fail "429 response missing/invalid Retry-After header (got: '$RETRY_AFTER')"
+    fi
+
+    # Cleanup: revoke the rate-limit-test key.
+    docker compose exec -T api python -m scripts.issue_key \
+        --tenant "$RATELIMIT_TENANT" --revoke "$RL_PREFIX" > /dev/null 2>&1
 fi
 
 # ----------------------------------------------------------------------------
