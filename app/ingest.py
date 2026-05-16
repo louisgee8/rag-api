@@ -24,6 +24,7 @@ from pypdf import PdfReader
 from app.chunker import recursive_split
 from app.db import get_conn
 from app.embeddings import encode
+from app.security.pii import scan_or_raise
 
 
 # Sec+: allowlist by MIME type, never trust extensions. .pdf.exe would slip a
@@ -104,7 +105,16 @@ def ingest_text(
     text: str,
     metadata: dict[str, Any] | None = None,
 ) -> IngestResult:
-    """JSON-body entry point. Used by POST /ingest with {source, text} body."""
+    """
+    JSON-body entry point. Used by POST /ingest with {source, text} body.
+
+    Phase 2 Step 3: scans for PII before any persistence work. Raises
+    `PIIDetectedError` on hit (caught at the route layer -> HTTP 400).
+    Scan runs on the full text — cheaper than scanning every chunk, and
+    catches patterns that span chunk boundaries (a chunker that splits an
+    SSN across two chunks would otherwise pass both halves through).
+    """
+    scan_or_raise(text)
     chunks = recursive_split(text)
     if not chunks:
         # Empty/whitespace-only text. Don't even hit the DB — return zeros.

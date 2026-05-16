@@ -17,6 +17,11 @@
 #   Phase 2 Step 2 additions:
 #    10. Burst N+1 reqs vs RATE_LIMIT        → exactly N×200 + 1×429
 #    11. 429 response carries Retry-After    → header > 0
+#   Phase 2 Step 3 additions:
+#    12. /ingest SSN              → 400, kinds contains ssn
+#    13. /ingest email            → 400, kinds contains email
+#    14. /ingest US phone         → 400, kinds contains phone
+#    15. /ingest Luhn-valid CC    → 400, kinds contains credit_card
 #
 # Usage:
 #   ./tests/smoke.sh                          # default: skip Anthropic call
@@ -293,6 +298,91 @@ else
     # Cleanup: revoke the rate-limit-test key.
     docker compose exec -T api python -m scripts.issue_key \
         --tenant "$RATELIMIT_TENANT" --revoke "$RL_PREFIX" > /dev/null 2>&1
+fi
+
+# ----------------------------------------------------------------------------
+# Tests 12-15 (Phase 2 Step 3): PII detection on /ingest.
+#
+# Each test fires a single /ingest with text containing one PII pattern.
+# Expected: 400 with body {"detail": {"error": "pii_detected",
+# "kinds": [{"kind": "<x>", "count": N}]}}.
+# Fresh tenant keeps the rate-limit budget clean across the four tests.
+# ----------------------------------------------------------------------------
+PII_TENANT="smoke-pii"
+echo "----------------------------------------"
+echo "Minting fresh key for PII tests (tenant=$PII_TENANT) ..."
+PII_ISSUE_OUTPUT=$(docker compose exec -T api python -m scripts.issue_key --tenant "$PII_TENANT" 2>&1)
+if [[ $? -ne 0 ]]; then
+    fail "Could not mint PII-test key: $PII_ISSUE_OUTPUT"
+else
+    PII_TOKEN=$(echo "$PII_ISSUE_OUTPUT" | grep -E '^[[:space:]]*token[[:space:]]*:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    PII_PREFIX=$(echo "$PII_ISSUE_OUTPUT" | grep -E '^[[:space:]]*key_prefix[[:space:]]*:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+
+    # Helper: fires /ingest with the given text, asserts 400 + expected kind.
+    # $1 = test label,  $2 = text body,  $3 = expected kind name
+    assert_pii_rejected() {
+        local label="$1"
+        local text="$2"
+        local expected_kind="$3"
+
+        local http
+        http=$(curl -s -o /tmp/smoke_pii.json -w "%{http_code}" \
+            -X POST "$API_URL/ingest" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $PII_TOKEN" \
+            -d "{\"source\":\"pii-test-$expected_kind\",\"text\":\"$text\"}")
+
+        if [[ "$http" != "400" ]]; then
+            fail "$label expected 400, got $http: $(cat /tmp/smoke_pii.json)"
+            return
+        fi
+
+        # Parse the JSON detail. Look for the expected kind in detail.kinds.
+        local body_check
+        body_check=$(python3 -c "
+import json, sys
+d = json.load(open('/tmp/smoke_pii.json'))
+detail = d.get('detail', {})
+if detail.get('error') != 'pii_detected':
+    print('NO_ERROR_FLAG'); sys.exit()
+kinds = [k['kind'] for k in detail.get('kinds', [])]
+print('$expected_kind' if '$expected_kind' in kinds else 'MISSING:' + ','.join(kinds))
+")
+
+        if [[ "$body_check" == "$expected_kind" ]]; then
+            pass "$label → 400, kinds contains $expected_kind"
+        else
+            fail "$label → 400 but body check failed (got: $body_check)"
+        fi
+    }
+
+    # Test 12 — SSN
+    assert_pii_rejected \
+        "POST /ingest (SSN in text)" \
+        "Background check note: applicant SSN 123-45-6789 was verified." \
+        "ssn"
+
+    # Test 13 — Email
+    assert_pii_rejected \
+        "POST /ingest (email in text)" \
+        "Contact details on file: reach me at gino@example.com for questions." \
+        "email"
+
+    # Test 14 — US phone
+    assert_pii_rejected \
+        "POST /ingest (US phone in text)" \
+        "Support escalation: call back number is (415) 555-1212 anytime." \
+        "phone"
+
+    # Test 15 — Credit card (Luhn-valid Visa test number)
+    assert_pii_rejected \
+        "POST /ingest (Luhn-valid CC in text)" \
+        "Receipt: charged 4532 0151 1283 0366 for the renewal." \
+        "credit_card"
+
+    # Cleanup: revoke the PII-test key.
+    docker compose exec -T api python -m scripts.issue_key \
+        --tenant "$PII_TENANT" --revoke "$PII_PREFIX" > /dev/null 2>&1
 fi
 
 # ----------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 A Retrieval-Augmented Generation (RAG) API built with FastAPI, Postgres + pgvector, sentence-transformers, and Anthropic's Claude.
 
-**Status:** Phase 2 Step 2 shipped — per-key rate limiting on top of per-tenant API keys.
+**Status:** Phase 2 Step 3 shipped — hard-reject PII detection on `/ingest`, on top of per-tenant API keys and per-key rate limiting.
 
 ## What it does
 
@@ -19,6 +19,7 @@ Ingests documents (text or PDF), chunks and embeds them into a Postgres vector d
 | Container | Docker Compose, native ARM64 on Apple Silicon |
 | Auth | Per-tenant bearer keys: SHA-256 hashed in `api_keys` table, indexed lookup, soft-delete revocation |
 | Rate limit | In-memory fixed-window counter, per `key_id`, env-tunable (default 60 req / 60 s) |
+| DLP | Hard-reject PII at `/ingest` (SSN / email / US phone / Luhn-valid credit card) |
 
 ## Quick start
 
@@ -83,6 +84,22 @@ The script is idempotent. It uses a fixed source name (`smoke-test-fixture`) and
 
 ## Security posture
 
+### Phase 2 Step 3 — PII detection on `/ingest` (Sec+ domain: DLP, Confidentiality)
+
+- Hard-reject policy. Any matched pattern returns `HTTP 400` with body `{"detail": {"error": "pii_detected", "kinds": [{"kind": "<x>", "count": N}, ...]}}`. The rejection message names the KIND but never echoes the matched value — echoing would itself be a PII leak (request logs, error scrapers).
+- Pattern set is intentionally narrow and stdlib-only (`re`): SSN (NANP dashed format), RFC 5322-lite email, NANP phone (four common formattings), credit card (13-19 digits with Luhn checksum). Luhn cuts random-digit-run false positives by roughly 90%.
+- Scan runs on the full text BEFORE chunking. Catches patterns that would otherwise straddle a chunk boundary (an SSN split across two chunks would slip a per-chunk scan).
+- Lives in `app/security/pii.py`. Public surface: `scan_for_pii(text) -> list[PIIHit]`, `summarize_hits(hits) -> list[dict]`, `scan_or_raise(text)` (raises `PIIDetectedError` on hit). The route layer catches the exception and converts to the 400.
+- Cost asymmetry: false negatives (real PII slips through into the vector store) are catastrophic and unrecoverable — once embedded, the value is queryable and there is no "un-ingest" button. False positives (legit doc rejected) are cheap and recoverable. The control is tuned to prefer the recoverable failure.
+
+**Known limitations (intentional, documented for future hardening):**
+
+1. **No unformatted-SSN detection** — `123456789` is not flagged. Adding `\b\d{9}\b` would flag every 9-digit order ID, tracking number, and pasted hash. The false-positive cost exceeds the recall gain for portfolio scope.
+2. **NANP / US-only** — international PII (IBAN, EU phone formats, non-Latin scripts) is not detected. Documented Phase 3 swap point: integrate Microsoft Presidio for multi-locale + NER (names, addresses, MRNs).
+3. **No name / address / DOB detection** — pure regex cannot do named-entity recognition. Same Presidio swap point.
+4. **No Unicode normalization** — full-width digits, zero-width-space splits between digits, base64-encoded values, and other obfuscation bypass the regex. Documented bypass; mitigations belong with the prompt-injection-defense work in Step 4.
+5. **Lookaround false positives** — phone-shaped digit runs embedded in alphanumeric IDs (e.g. `id14155551212`) will trigger. Trade-off taken in exchange for catching obfuscation via letter-prefixed phones.
+
 ### Phase 2 Step 2 — Per-key rate limiting (Sec+ domain: Availability / DoS, IAM abuse containment)
 
 - Fixed-window counter, in-memory, keyed by `api_keys.id`. Default: `RATE_LIMIT_REQUESTS=60` requests per `RATE_LIMIT_WINDOW_SECONDS=60` seconds, both env-tunable.
@@ -122,8 +139,8 @@ The script is idempotent. It uses a fixed source name (`smoke-test-fixture`) and
 ## Phase 2 roadmap
 
 - [x] **Step 1**: Per-tenant API keys.
-- [x] **Step 2**: Per-key rate limiting (this release).
-- [ ] Step 3: PII redaction on `/ingest`.
+- [x] **Step 2**: Per-key rate limiting.
+- [x] **Step 3**: PII hard-reject on `/ingest` (this release).
 - [ ] Step 4: Prompt injection defense.
 - [ ] Step 5: Relevance threshold for "I don't know" responses.
 - [ ] Step 6: Structured audit logging.

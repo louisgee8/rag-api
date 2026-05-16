@@ -21,13 +21,14 @@ from pydantic import BaseModel, Field
 from app import ingest as ingest_lib
 from app import retrieval as retrieval_lib
 from app import synthesis as synthesis_lib
+from app.security.pii import PIIDetectedError
 from app.security.ratelimit import enforce_rate_limit
 
 
 app = FastAPI(
     title="rag-api",
-    description="Retrieval-Augmented Generation API. Phase 2 Step 2 — rate limiting.",
-    version="0.7.0",
+    description="Retrieval-Augmented Generation API. Phase 2 Step 3 — PII detection.",
+    version="0.8.0",
 )
 
 
@@ -103,12 +104,22 @@ def ingest_text_endpoint(payload: IngestTextRequest) -> IngestResponse:
 
     Pydantic validates source/text non-empty BEFORE the handler runs;
     malformed payloads return 422 automatically.
+
+    PII detection (Phase 2 Step 3): SSN / email / US phone / Luhn-valid CC
+    in the text body -> 400 with {"detail": {"error": "pii_detected",
+    "kinds": [{"kind": "ssn", "count": N}, ...]}}. Values never echoed.
     """
-    result = ingest_lib.ingest_text(
-        source=payload.source,
-        text=payload.text,
-        metadata=payload.metadata,
-    )
+    try:
+        result = ingest_lib.ingest_text(
+            source=payload.source,
+            text=payload.text,
+            metadata=payload.metadata,
+        )
+    except PIIDetectedError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "pii_detected", "kinds": e.summary},
+        )
     return IngestResponse(
         source=result.source,
         chunks_created=result.chunks_created,
@@ -139,6 +150,12 @@ def ingest_file_endpoint(
             source=source,
             file_bytes=file_bytes,
             content_type=file.content_type or "",
+        )
+    except PIIDetectedError as e:
+        # Phase 2 Step 3: same rejection contract as /ingest JSON path.
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "pii_detected", "kinds": e.summary},
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
