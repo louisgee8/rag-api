@@ -24,7 +24,8 @@ from pypdf import PdfReader
 from app.chunker import recursive_split
 from app.db import get_conn
 from app.embeddings import encode
-from app.security.pii import scan_or_raise
+from app.security.injection import scan_or_raise as injection_scan_or_raise
+from app.security.pii import scan_or_raise as pii_scan_or_raise
 
 
 # Sec+: allowlist by MIME type, never trust extensions. .pdf.exe would slip a
@@ -113,8 +114,17 @@ def ingest_text(
     Scan runs on the full text — cheaper than scanning every chunk, and
     catches patterns that span chunk boundaries (a chunker that splits an
     SSN across two chunks would otherwise pass both halves through).
+
+    Phase 2 Step 4 (indirect prompt injection): scans for jailbreak
+    phrases BEFORE the PII scan. Cheaper to reject an injection attempt
+    up-front than to scan it for PII first. Raises `InjectionDetectedError`
+    on hit (caught at the route layer -> HTTP 400). Closes the indirect
+    injection vector: an attacker who plants "ignore previous instructions"
+    inside a doc never lands the doc in the chunks table or vector index,
+    so it never gets retrieved into a later victim's prompt.
     """
-    scan_or_raise(text)
+    injection_scan_or_raise(text)
+    pii_scan_or_raise(text)
     chunks = recursive_split(text)
     if not chunks:
         # Empty/whitespace-only text. Don't even hit the DB — return zeros.

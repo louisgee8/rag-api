@@ -60,13 +60,26 @@ What this module deliberately does NOT do:
     - Echo the matched value back in the rejection message. The 400 body
       names the KIND and COUNT only — never the value. Echoing would itself
       be a PII leak (e.g. log scraping the 400 responses).
-    - Normalize Unicode digits, full-width forms, or zero-width-space
-      obfuscation. Documented as a known bypass.
+    - Detect base64-encoded PII. Detection would require trying to b64decode
+      every numeric-looking chunk (expensive + false positives) or entropy
+      heuristics (noisy). Documented as a hard limit.
+
+Step 3.5 hardening (2026-05-17):
+    NFKC normalization + zero-width strip + digit-separator collapse
+    pre-pass. Closes 6 of 7 known bypass classes (full-width chars,
+    zero-width splits, spaced digits, underscore CCs, spaced emails,
+    spaced phones). Base64 remains a documented bypass.
+
+    Spans in returned PIIHit objects reference the normalized view, not
+    the original text. Acceptable because we never echo matched values
+    back to clients — only kind+count. Audit logs use the normalized
+    spans as best-effort offsets.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -145,8 +158,50 @@ def _luhn_valid(digits: str) -> bool:
 
 
 def _strip_to_digits(raw: str) -> str:
-    """Remove spaces and hyphens. Used to normalize a CC candidate before Luhn."""
-    return raw.replace(" ", "").replace("-", "")
+    """Remove spaces, hyphens, underscores. Normalizes a CC candidate before Luhn."""
+    return raw.replace(" ", "").replace("-", "").replace("_", "")
+
+
+# ---------------------------------------------------------------------------
+# Step 3.5: Normalization pre-pass.
+# Production DLP (Presidio, AWS Macie, Microsoft Purview) all do this. The
+# detector reads a normalized view of the input — pure regex on raw bytes
+# loses to any attacker who knows the alphabet is bigger than ASCII.
+# ---------------------------------------------------------------------------
+
+# Zero-width characters used for obfuscation. ZWSP, ZWNJ, ZWJ, BOM.
+_ZERO_WIDTH_RE = re.compile("[​‌‍﻿]")
+
+# Inside a numeric run, drop spaces/underscores adjacent to digits OR to
+# format separators (`-`, `.`). Broader char class catches the case where
+# the obfuscator pads BOTH the digits AND the dashes: `1 2 3 - 4 5 - 6 7 8 9`.
+# Still leaves prose alone — `2 - 1 = 1` collapses to `2-1=1` which is benign
+# and doesn't match any PII pattern.
+_INTERDIGIT_SEP_RE = re.compile(r"(?<=[\d\-\.])[ _]+(?=[\d\-\.])")
+
+# Collapse whitespace padding around the @ sign for email scanning.
+# Catches `user @ example.com`. Tight by design — only collapses on @.
+_EMAIL_PADDING_RE = re.compile(r"\s*@\s*")
+
+
+def _normalize_for_scan(text: str) -> str:
+    """
+    NFKC + strip zero-width. Used as the base view for every pattern.
+    NFKC ('Normalization Form Compatibility Composition') folds full-width
+    digits, full-width @, full-width period, etc. down to their ASCII
+    equivalents — defeating the cheapest obfuscation tier in one call.
+    """
+    return _ZERO_WIDTH_RE.sub("", unicodedata.normalize("NFKC", text))
+
+
+def _collapse_digit_separators(text: str) -> str:
+    """Drop spaces/underscores between adjacent digits. Numeric-pattern view."""
+    return _INTERDIGIT_SEP_RE.sub("", text)
+
+
+def _collapse_email_padding(text: str) -> str:
+    """Collapse whitespace around @. Email-pattern view."""
+    return _EMAIL_PADDING_RE.sub("@", text)
 
 
 # ---------------------------------------------------------------------------
@@ -159,26 +214,42 @@ def scan_for_pii(text: str) -> list[PIIHit]:
     Empty list means clean. Caller decides what to do with non-empty result
     (this module's job is detection, not response).
 
-    Performance note: compiled patterns + single-pass per pattern. For a
-    1MB input, this runs in low single-digit milliseconds on a laptop —
-    cheap enough to apply unconditionally on every /ingest call.
+    Scanning runs against THREE normalized views built from the input:
+      - base: NFKC + zero-width strip. Defeats #1 (Unicode forms) and #4
+        (zero-width splits) without touching whitespace semantics.
+      - numeric: base + interdigit space/underscore collapse. Defeats #2
+        (spaced SSN/phone) and #7 (underscore-separated CC).
+      - email: base + @-padding collapse. Defeats #6 (spaced email).
+
+    Performance note: compiled patterns + four single-pass scans + three
+    cheap rewrites. Low single-digit ms per MB. Cheap enough to apply
+    unconditionally on every /ingest call.
+
+    Span fidelity: spans reference the normalized view, not the original.
+    Acceptable here because we never echo matched values — only kind+count.
     """
     hits: list[PIIHit] = []
 
-    for match in SSN_RE.finditer(text):
+    base = _normalize_for_scan(text)
+    numeric_view = _collapse_digit_separators(base)
+    email_view = _collapse_email_padding(base)
+
+    # Numeric patterns run on the digit-collapsed view.
+    for match in SSN_RE.finditer(numeric_view):
         hits.append(PIIHit(kind="ssn", span=match.span()))
 
-    for match in EMAIL_RE.finditer(text):
-        hits.append(PIIHit(kind="email", span=match.span()))
-
-    for match in PHONE_RE.finditer(text):
+    for match in PHONE_RE.finditer(numeric_view):
         hits.append(PIIHit(kind="phone", span=match.span()))
 
-    for match in CC_CANDIDATE_RE.finditer(text):
+    for match in CC_CANDIDATE_RE.finditer(numeric_view):
         raw = match.group(0)
         digits = _strip_to_digits(raw)
         if 13 <= len(digits) <= 19 and _luhn_valid(digits):
             hits.append(PIIHit(kind="credit_card", span=match.span()))
+
+    # Email runs on the @-padding-collapsed view.
+    for match in EMAIL_RE.finditer(email_view):
+        hits.append(PIIHit(kind="email", span=match.span()))
 
     hits.sort(key=lambda h: h.span[0])
     return hits

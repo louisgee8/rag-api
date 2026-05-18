@@ -21,14 +21,15 @@ from pydantic import BaseModel, Field
 from app import ingest as ingest_lib
 from app import retrieval as retrieval_lib
 from app import synthesis as synthesis_lib
+from app.security.injection import InjectionDetectedError, scan_or_raise as injection_scan_or_raise
 from app.security.pii import PIIDetectedError
 from app.security.ratelimit import enforce_rate_limit
 
 
 app = FastAPI(
     title="rag-api",
-    description="Retrieval-Augmented Generation API. Phase 2 Step 3 — PII detection.",
-    version="0.8.0",
+    description="Retrieval-Augmented Generation API. Phase 2 Step 4 — prompt injection defense (filter + fence).",
+    version="0.9.0",
 )
 
 
@@ -108,12 +109,22 @@ def ingest_text_endpoint(payload: IngestTextRequest) -> IngestResponse:
     PII detection (Phase 2 Step 3): SSN / email / US phone / Luhn-valid CC
     in the text body -> 400 with {"detail": {"error": "pii_detected",
     "kinds": [{"kind": "ssn", "count": N}, ...]}}. Values never echoed.
+
+    Indirect prompt injection (Phase 2 Step 4): jailbreak phrases in the
+    text body -> 400 with {"detail": {"error": "prompt_injection_detected",
+    "kinds": [{"kind": "override", "count": N}, ...]}}. Same hard-reject
+    contract as PII.
     """
     try:
         result = ingest_lib.ingest_text(
             source=payload.source,
             text=payload.text,
             metadata=payload.metadata,
+        )
+    except InjectionDetectedError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "prompt_injection_detected", "kinds": e.summary},
         )
     except PIIDetectedError as e:
         raise HTTPException(
@@ -141,6 +152,7 @@ def ingest_file_endpoint(
     - file: must be application/pdf or text/plain, <= 10MB
 
     Mime/size violations -> 400 (caught from ValueError in ingest_lib).
+    Indirect prompt injection -> 400 (Step 4, same contract as /ingest).
     """
     # file.file is the underlying SpooledTemporaryFile (sync read is fine
     # because this is a sync handler running in FastAPI's thread pool).
@@ -150,6 +162,11 @@ def ingest_file_endpoint(
             source=source,
             file_bytes=file_bytes,
             content_type=file.content_type or "",
+        )
+    except InjectionDetectedError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "prompt_injection_detected", "kinds": e.summary},
         )
     except PIIDetectedError as e:
         # Phase 2 Step 3: same rejection contract as /ingest JSON path.
@@ -206,11 +223,27 @@ def query_answer_endpoint(payload: QueryRequest) -> QueryAnswerResponse:
     Retrieve top-K chunks AND synthesize an answer via Anthropic.
 
     Failure modes mapped to HTTP:
+    - prompt injection in question  -> 400 (Phase 2 Step 4 direct defense)
     - empty/invalid question        -> 400
     - Anthropic auth failure        -> 502 (upstream auth, not our auth)
     - Anthropic rate limit/timeout  -> 504
     - Other Anthropic API errors    -> 502
+
+    Phase 2 Step 4 (direct prompt injection): scans the user's question
+    against the jailbreak blocklist BEFORE retrieval. Rejection happens
+    upstream of the embed call and the LLM call — saves both compute and
+    risk surface. Structural defense (fenced context + hardened system
+    prompt) lives in app.synthesis and runs unconditionally on the chunks
+    that make it past retrieval.
     """
+    try:
+        injection_scan_or_raise(payload.question)
+    except InjectionDetectedError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "prompt_injection_detected", "kinds": e.summary},
+        )
+
     try:
         chunks = retrieval_lib.retrieve(
             question=payload.question,
