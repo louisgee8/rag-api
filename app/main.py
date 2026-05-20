@@ -21,6 +21,8 @@ from pydantic import BaseModel, Field
 from app import ingest as ingest_lib
 from app import retrieval as retrieval_lib
 from app import synthesis as synthesis_lib
+from app.auth import TenantIdentity
+from app.security import audit
 from app.security.injection import InjectionDetectedError, scan_or_raise as injection_scan_or_raise
 from app.security.pii import PIIDetectedError
 from app.security.ratelimit import enforce_rate_limit
@@ -29,8 +31,8 @@ from app.security.relevance import LowConfidenceError, evaluate_or_raise as rele
 
 app = FastAPI(
     title="rag-api",
-    description="Retrieval-Augmented Generation API. Phase 2 Step 5 — relevance threshold (gap-to-#2 gate on /query/answer).",
-    version="0.10.0",
+    description="Retrieval-Augmented Generation API. Phase 2 Step 6 — structured audit logging (JSONL on stdout for every security-relevant event).",
+    version="0.11.0",
 )
 
 
@@ -98,9 +100,11 @@ def health() -> dict:
     return {"status": "ok", "service": "rag-api", "version": app.version}
 
 
-@app.post("/ingest", response_model=IngestResponse, tags=["ingest"],
-          dependencies=[Depends(enforce_rate_limit)])
-def ingest_text_endpoint(payload: IngestTextRequest) -> IngestResponse:
+@app.post("/ingest", response_model=IngestResponse, tags=["ingest"])
+def ingest_text_endpoint(
+    payload: IngestTextRequest,
+    identity: TenantIdentity = Depends(enforce_rate_limit),
+) -> IngestResponse:
     """
     Ingest raw text via JSON body.
 
@@ -115,6 +119,9 @@ def ingest_text_endpoint(payload: IngestTextRequest) -> IngestResponse:
     text body -> 400 with {"detail": {"error": "prompt_injection_detected",
     "kinds": [{"kind": "override", "count": N}, ...]}}. Same hard-reject
     contract as PII.
+
+    Phase 2 Step 6: emits ingest.success / pii.detected / injection.detected
+    audit events, correlated via identity.request_id.
     """
     try:
         result = ingest_lib.ingest_text(
@@ -123,15 +130,42 @@ def ingest_text_endpoint(payload: IngestTextRequest) -> IngestResponse:
             metadata=payload.metadata,
         )
     except InjectionDetectedError as e:
+        audit.emit(
+            audit.EVT_INJECTION_DETECTED,
+            key_prefix=identity.key_prefix,
+            tenant=identity.tenant_id,
+            request_id=identity.request_id,
+            kinds=e.summary,
+            route="/ingest",
+        )
         raise HTTPException(
             status_code=400,
             detail={"error": "prompt_injection_detected", "kinds": e.summary},
         )
     except PIIDetectedError as e:
+        audit.emit(
+            audit.EVT_PII_DETECTED,
+            key_prefix=identity.key_prefix,
+            tenant=identity.tenant_id,
+            request_id=identity.request_id,
+            kinds=e.summary,
+            route="/ingest",
+        )
         raise HTTPException(
             status_code=400,
             detail={"error": "pii_detected", "kinds": e.summary},
         )
+
+    audit.emit(
+        audit.EVT_INGEST_SUCCESS,
+        key_prefix=identity.key_prefix,
+        tenant=identity.tenant_id,
+        request_id=identity.request_id,
+        source=result.source,
+        chunks_created=result.chunks_created,
+        chunks_replaced=result.chunks_replaced,
+        route="/ingest",
+    )
     return IngestResponse(
         source=result.source,
         chunks_created=result.chunks_created,
@@ -139,11 +173,11 @@ def ingest_text_endpoint(payload: IngestTextRequest) -> IngestResponse:
     )
 
 
-@app.post("/ingest/file", response_model=IngestResponse, tags=["ingest"],
-          dependencies=[Depends(enforce_rate_limit)])
+@app.post("/ingest/file", response_model=IngestResponse, tags=["ingest"])
 def ingest_file_endpoint(
     source: str = Form(..., min_length=1, max_length=512),
     file: UploadFile = File(...),
+    identity: TenantIdentity = Depends(enforce_rate_limit),
 ) -> IngestResponse:
     """
     Ingest a file (PDF or text) via multipart upload.
@@ -154,6 +188,9 @@ def ingest_file_endpoint(
 
     Mime/size violations -> 400 (caught from ValueError in ingest_lib).
     Indirect prompt injection -> 400 (Step 4, same contract as /ingest).
+
+    Phase 2 Step 6: emits ingest.success / pii.detected / injection.detected
+    audit events, correlated via identity.request_id.
     """
     # file.file is the underlying SpooledTemporaryFile (sync read is fine
     # because this is a sync handler running in FastAPI's thread pool).
@@ -165,12 +202,28 @@ def ingest_file_endpoint(
             content_type=file.content_type or "",
         )
     except InjectionDetectedError as e:
+        audit.emit(
+            audit.EVT_INJECTION_DETECTED,
+            key_prefix=identity.key_prefix,
+            tenant=identity.tenant_id,
+            request_id=identity.request_id,
+            kinds=e.summary,
+            route="/ingest/file",
+        )
         raise HTTPException(
             status_code=400,
             detail={"error": "prompt_injection_detected", "kinds": e.summary},
         )
     except PIIDetectedError as e:
         # Phase 2 Step 3: same rejection contract as /ingest JSON path.
+        audit.emit(
+            audit.EVT_PII_DETECTED,
+            key_prefix=identity.key_prefix,
+            tenant=identity.tenant_id,
+            request_id=identity.request_id,
+            kinds=e.summary,
+            route="/ingest/file",
+        )
         raise HTTPException(
             status_code=400,
             detail={"error": "pii_detected", "kinds": e.summary},
@@ -178,6 +231,16 @@ def ingest_file_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    audit.emit(
+        audit.EVT_INGEST_SUCCESS,
+        key_prefix=identity.key_prefix,
+        tenant=identity.tenant_id,
+        request_id=identity.request_id,
+        source=result.source,
+        chunks_created=result.chunks_created,
+        chunks_replaced=result.chunks_replaced,
+        route="/ingest/file",
+    )
     return IngestResponse(
         source=result.source,
         chunks_created=result.chunks_created,
@@ -185,9 +248,11 @@ def ingest_file_endpoint(
     )
 
 
-@app.post("/query/retrieve", response_model=QueryRetrieveResponse, tags=["query"],
-          dependencies=[Depends(enforce_rate_limit)])
-def query_retrieve_endpoint(payload: QueryRequest) -> QueryRetrieveResponse:
+@app.post("/query/retrieve", response_model=QueryRetrieveResponse, tags=["query"])
+def query_retrieve_endpoint(
+    payload: QueryRequest,
+    identity: TenantIdentity = Depends(enforce_rate_limit),
+) -> QueryRetrieveResponse:
     """
     Retrieve top-K chunks most similar to `question`. No LLM call.
 
@@ -217,9 +282,11 @@ def query_retrieve_endpoint(payload: QueryRequest) -> QueryRetrieveResponse:
     )
 
 
-@app.post("/query/answer", response_model=QueryAnswerResponse, tags=["query"],
-          dependencies=[Depends(enforce_rate_limit)])
-def query_answer_endpoint(payload: QueryRequest) -> QueryAnswerResponse:
+@app.post("/query/answer", response_model=QueryAnswerResponse, tags=["query"])
+def query_answer_endpoint(
+    payload: QueryRequest,
+    identity: TenantIdentity = Depends(enforce_rate_limit),
+) -> QueryAnswerResponse:
     """
     Retrieve top-K chunks AND synthesize an answer via Anthropic.
 
@@ -249,6 +316,16 @@ def query_answer_endpoint(payload: QueryRequest) -> QueryAnswerResponse:
     try:
         injection_scan_or_raise(payload.question)
     except InjectionDetectedError as e:
+        # Direct prompt injection on the question itself. Audit + reject.
+        audit.emit(
+            audit.EVT_INJECTION_DETECTED,
+            key_prefix=identity.key_prefix,
+            tenant=identity.tenant_id,
+            request_id=identity.request_id,
+            kinds=e.summary,
+            route="/query/answer",
+            site="question",
+        )
         raise HTTPException(
             status_code=400,
             detail={"error": "prompt_injection_detected", "kinds": e.summary},
@@ -267,6 +344,21 @@ def query_answer_endpoint(payload: QueryRequest) -> QueryAnswerResponse:
     try:
         relevance_evaluate_or_raise(chunks)
     except LowConfidenceError as e:
+        # Phase 2 Step 6: audit the gate fire. Carries reason + gap +
+        # threshold so the SIEM can spot a tenant with a chronically
+        # mis-tuned corpus (mostly insufficient_gap) vs one starved of
+        # documents (mostly single_candidate / empty_result).
+        audit.emit(
+            audit.EVT_RELEVANCE_LOW_CONFIDENCE,
+            key_prefix=identity.key_prefix,
+            tenant=identity.tenant_id,
+            request_id=identity.request_id,
+            reason=e.reason,
+            chunks_returned=e.chunks_returned,
+            top_distance=e.top_distance,
+            gap=e.gap,
+            threshold=e.threshold,
+        )
         raise HTTPException(status_code=422, detail=e.envelope)
 
     try:
@@ -281,6 +373,16 @@ def query_answer_endpoint(payload: QueryRequest) -> QueryAnswerResponse:
     except anthropic.APIError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic upstream error: {e}")
 
+    audit.emit(
+        audit.EVT_QUERY_ANSWER_SUCCESS,
+        key_prefix=identity.key_prefix,
+        tenant=identity.tenant_id,
+        request_id=identity.request_id,
+        chunks_used=len(result.chunks_used),
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        model=result.model,
+    )
     return QueryAnswerResponse(
         question=payload.question,
         answer=result.answer,

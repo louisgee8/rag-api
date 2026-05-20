@@ -2,7 +2,7 @@
 
 A Retrieval-Augmented Generation (RAG) API built with FastAPI, Postgres + pgvector, sentence-transformers, and Anthropic's Claude.
 
-**Status:** Phase 2 Step 4 shipped — layered prompt injection defense (regex filter + per-request random fence tokens + hardened system prompt) covering both direct injection (`/query/answer`) and indirect injection (`/ingest`). NFKC normalization (Step 3.5) closed six of seven known PII bypass classes. Earlier layers: hard-reject PII detection on `/ingest`, per-tenant API keys, per-key rate limiting.
+**Status:** Phase 2 Step 6 shipped — structured audit logging. Every security-relevant event (auth success/failure, rate-limit exceeded, PII detected, injection detected, low-confidence retrieval, ingest success, query.answer success) is emitted as one JSON line on the api container's stdout, correlated across one request by a uuid4 `request_id`. Earlier layers: relevance threshold (Step 5), prompt injection defense (Step 4), NFKC normalization (Step 3.5), PII hard-reject (Step 3), per-key rate limiting (Step 2), per-tenant API keys (Step 1).
 
 ## What it does
 
@@ -22,6 +22,7 @@ Ingests documents (text or PDF), chunks and embeds them into a Postgres vector d
 | DLP | Hard-reject PII at `/ingest` (SSN / email / US phone / Luhn-valid credit card). NFKC-normalized to defeat Unicode + whitespace + underscore obfuscation. |
 | Prompt injection | Layered defense: regex blocklist on input (direct + indirect), per-request random fence tokens around retrieved chunks, hardened system prompt labeling fenced content as data not instructions |
 | Relevance gate | Gap-to-#2 cosine-distance threshold on `/query/answer`. Low-confidence retrievals return `HTTP 422 low_confidence` BEFORE the Anthropic call — refuses to hallucinate when the corpus can't answer. |
+| Audit log | Structured JSONL on stdout. Uniform envelope (`ts`, `event_type`, `key_prefix`, `tenant`, `request_id`, `payload`) across 8 event types. Append-only, log-driver rotated, SIEM-ready. Caller-side redaction discipline: identifiers in, secrets out. |
 
 ## Quick start
 
@@ -86,7 +87,33 @@ The script is idempotent. It uses a fixed source name (`smoke-test-fixture`) and
 
 ## Security posture
 
-### Phase 2 Step 5 — Relevance threshold (Sec+ domain: Availability, Integrity / anti-hallucination) (this release)
+### Phase 2 Step 6 — Structured audit logging (Sec+ domain: Audit & Accountability, Incident Response) (this release)
+
+Every security-relevant action through the API leaves a structured, machine-parseable trail. Designed so a future investigator (or SIEM) can reconstruct a single request's full event sequence from any one event, without parsing freeform log strings.
+
+- **Sink — JSONL on stdout.** One JSON line per event. Docker's `json-file` log driver rotates the stream; Phase 3 will tee it into a cloud SIEM via a log shipper (Vector / Fluentbit). **Why not a Postgres `audit_events` table:** append-only by construction (no `UPDATE` to erase footprints via a SQL injection elsewhere), zero writes inside the request path, no migration / retention code to own, native ingestion path for every cloud logging stack. Trade-off accepted: search becomes a log-tool query, not SQL.
+- **Envelope.** Every event has the same outer shape so downstream parsers pivot on `event_type` without parser-specific hacks:
+  ```json
+  {"ts":"2026-05-20T01:59:21.873Z","event_type":"ingest.success",
+   "key_prefix":"rk_xxxxxxxx","tenant":"acme-corp",
+   "request_id":"<uuid4-hex>","payload":{...per-event fields...}}
+  ```
+  Timestamps are UTC, Z-suffixed, millisecond precision — lexicographically sortable so `sort` on the raw file produces chronological order.
+- **Correlation — `request_id`.** Minted once at auth entry (`audit.new_request_id()`), attached to the resolved `TenantIdentity`, threaded through every downstream emit. A single `/query/answer` request that fires `auth.success` → `ratelimit.exceeded` (or `injection.detected`, etc.) → `query.answer.success` produces three log lines sharing the same id. Investigators pivot on the id to reconstruct the full trail.
+- **Event types (8).** `auth.success`, `auth.failure` (with reason codes: `header_parse_failure`, `auth_store_down`, `unknown_key`, `revoked_key`), `ratelimit.exceeded`, `pii.detected`, `injection.detected`, `relevance.low_confidence`, `ingest.success`, `query.answer.success`. Defined as module-level constants in `app/security/audit.py` so a typo crashes at import time rather than becoming a silent SIEM blind spot.
+- **Redaction contract.** `emit()` does not introspect `payload`. Callers MUST pass identifiers (key_prefix, tenant, request_id), counts/kinds (`match_count`, `kinds=["ssn"]`), and structured outcomes (reason, status_code, gap, threshold). Callers MUST NOT pass raw secrets, PII values, or full request/response bodies. A leaked audit log itself should not constitute a breach.
+- **`auth.failure / unknown_key` discipline.** When an inbound token fails to match any row, we log the EXTRACTED PREFIX (first 11 chars / `extract_prefix`), never the full attempted token. Lets investigators spot "someone tried `rk_smkAudit...` 50 times in a minute" without storing the full guess attempt as something that could itself be tried elsewhere.
+- **Never raises.** Serialization failures inside `emit()` are caught and surface a diagnostic on stderr — the stdout JSONL stream is a contract with downstream parsers and must not be corrupted. A broken emit must not take down a request (same discipline as best-effort FINRA trade reporting: the reporter doesn't block execution).
+- **Lives in `app/security/audit.py`.** Stdlib only. Public surface: `emit(event_type, *, key_prefix=None, tenant=None, request_id=None, **payload)` + `new_request_id() -> str` + `EVT_*` constants.
+
+**Known limitations (intentional, documented for Phase 3 hardening):**
+
+1. **No persistence beyond log-driver rotation.** Docker's json-file driver caps log volume per container; rotated-out events are lost. Production needs a log shipper (Vector / Fluentbit / Filebeat) forwarding to durable storage (Loki / CloudWatch / Splunk). Drop-in: emit unchanged, the shipper does the work.
+2. **No tamper protection on the local sink.** A process running as root inside the container could in principle truncate the log buffer. Production should ship events to an append-only remote sink (write-once S3 + Object Lock, or an immutable WORM log store) before retention rotates the local copy. Acceptable risk for portfolio scope where the threat model is external API abuse, not insider container compromise.
+3. **Synchronous `print()` on the request path.** `emit()` writes inline, so an unusually slow log driver (full disk, blocked container runtime) could in theory add latency to a request. The catch in `emit()` prevents a crash but not a stall. Production should swap to a non-blocking queue + background flusher; for portfolio traffic this is over-engineering.
+4. **No sampling or rate limiting on the audit stream itself.** Every event is emitted. A high-traffic deployment may want to sample `auth.success` (very chatty) while keeping `auth.failure` at 100%. Sampler config is a Phase 3 add.
+
+### Phase 2 Step 5 — Relevance threshold (Sec+ domain: Availability, Integrity / anti-hallucination)
 
 Defends against the "confidently wrong" failure mode where the retriever returns *something* for any query, the LLM dutifully synthesizes an answer, and the user has no signal that the corpus didn't actually have the answer. Cheaper to refuse than to spend the Anthropic call and ship a hallucination.
 
@@ -200,8 +227,8 @@ Lives inline in `app/security/pii.py`. Spans in returned `PIIHit` objects refere
 - [x] **Step 3**: PII hard-reject on `/ingest`.
 - [x] **Step 3.5** (hotfix): NFKC normalization closing 6 of 7 PII bypasses.
 - [x] **Step 4**: Prompt injection defense (filter + structural fence + indirect coverage).
-- [x] **Step 5**: Relevance threshold (gap-to-#2 gate on `/query/answer`) (this release).
-- [ ] Step 6: Structured audit logging.
+- [x] **Step 5**: Relevance threshold (gap-to-#2 gate on `/query/answer`).
+- [x] **Step 6**: Structured audit logging (JSONL on stdout, 8 event types, correlated by `request_id`) (this release).
 - [ ] Step 7: CI/CD via GitHub Actions.
 
 ## License

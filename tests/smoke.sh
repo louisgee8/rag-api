@@ -645,6 +645,133 @@ PYEOF
 fi
 
 # ----------------------------------------------------------------------------
+# Tests 25-26: Audit logging (Phase 2 Step 6)
+# ----------------------------------------------------------------------------
+# Purpose: verify the audit emitter produces JSON lines on the api
+# container's stdout for two representative event types — one happy-path
+# (ingest.success) and one rejection-path (auth.failure / unknown_key).
+#
+# We observe events by tailing `docker compose logs api`. Audit lines go
+# to stdout; the json-file log driver captures them. Each event carries
+# the calling tenant + key_prefix + request_id, so we filter by tenant
+# (happy path) or by the attempted bogus prefix (rejection path) to
+# isolate THIS run's emissions from any pre-existing log buffer.
+#
+# Why a fresh-mint key here: this block lives well past line ~215 where
+# Test 8 revokes the main $TOKEN. Reusing $TOKEN would 401 at auth
+# BEFORE the ingest.success event ever fires. Pattern mirrors the
+# PII / injection / relevance test blocks above.
+echo "----------------------------------------"
+echo "Step 6: Audit logging events"
+echo "----------------------------------------"
+
+AUDIT_TENANT="smoke-audit"
+AUDIT_ISSUE_OUTPUT=$(docker compose exec -T api python -m scripts.issue_key --tenant "$AUDIT_TENANT" 2>&1)
+if [[ $? -ne 0 ]]; then
+    fail "Could not mint audit-test key: $AUDIT_ISSUE_OUTPUT"
+else
+    AUDIT_TOKEN=$(echo "$AUDIT_ISSUE_OUTPUT" | grep -E '^[[:space:]]*token[[:space:]]*:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    AUDIT_PREFIX=$(echo "$AUDIT_ISSUE_OUTPUT" | grep -E '^[[:space:]]*key_prefix[[:space:]]*:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+
+    # Test 25: ingest.success audit event on the happy path.
+    AUDIT_SOURCE="smoke-audit-doc-$$"
+    AUDIT_TEXT="Audit logging is the practice of recording security-relevant events for later analysis."
+    HTTP=$(curl -s -o /tmp/smoke_audit_ingest.json -w "%{http_code}" \
+        -X POST "$API_URL/ingest" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $AUDIT_TOKEN" \
+        -d "{\"source\":\"$AUDIT_SOURCE\",\"text\":\"$AUDIT_TEXT\"}")
+    if [[ "$HTTP" != "200" ]]; then
+        fail "Setup: POST /ingest for audit test expected 200, got $HTTP: $(cat /tmp/smoke_audit_ingest.json)"
+    else
+        # Give the log driver a beat to flush, then search for the event.
+        # We grep for the event_type AND the unique source so we cannot
+        # match a prior run's identical-looking event.
+        sleep 1
+        EVENT_LINE=$(docker compose logs api --tail 200 2>/dev/null \
+            | grep -F '"event_type":"ingest.success"' \
+            | grep -F "\"tenant\":\"$AUDIT_TENANT\"" \
+            | grep -F "\"source\":\"$AUDIT_SOURCE\"" \
+            | tail -1)
+        if [[ -n "$EVENT_LINE" ]]; then
+            # Confirm the envelope carries the redacted-by-design fields we
+            # expect — key_prefix present, no raw token, no request body.
+            BODY_CHECK=$(python3 - <<PYEOF
+import json, sys
+# The log line has a docker-compose log prefix like "rag-api-api-1  | {...}".
+# Strip everything up to the first '{'.
+line = """$EVENT_LINE"""
+brace = line.find('{')
+if brace < 0:
+    print("NO_JSON_IN_LINE"); sys.exit()
+try:
+    evt = json.loads(line[brace:])
+except Exception as e:
+    print(f"PARSE_FAIL:{e}"); sys.exit()
+checks = []
+checks.append(("event_type", evt.get("event_type") == "ingest.success"))
+checks.append(("tenant", evt.get("tenant") == "$AUDIT_TENANT"))
+checks.append(("key_prefix_present", isinstance(evt.get("key_prefix"), str) and evt["key_prefix"].startswith("rk_")))
+checks.append(("request_id_present", isinstance(evt.get("request_id"), str) and len(evt["request_id"]) == 32))
+checks.append(("payload_chunks_created", evt.get("payload", {}).get("chunks_created", 0) >= 1))
+checks.append(("no_raw_token", "$AUDIT_TOKEN" not in line))
+failed = [name for name, ok in checks if not ok]
+if failed:
+    print(f"FAIL_FIELDS:{failed}")
+else:
+    print("OK")
+PYEOF
+)
+            if [[ "$BODY_CHECK" == "OK" ]]; then
+                pass "Audit event 'ingest.success' emitted with correct envelope and no token leak"
+            else
+                fail "Audit event 'ingest.success' envelope check: $BODY_CHECK"
+            fi
+        else
+            fail "Audit event 'ingest.success' not found in container logs (tenant=$AUDIT_TENANT source=$AUDIT_SOURCE)"
+        fi
+    fi
+
+    # Test 26: auth.failure / unknown_key audit event on the rejection path.
+    # Craft a bogus token whose first 11 chars (PREFIX_LEN) form a unique,
+    # greppable signature so we can isolate THIS attempt from any other
+    # auth failure that happened to fire during the smoke run.
+    BAD_TOKEN="rk_smkAudit_999999_garbage_garbage_garbage_garbage_garbage"
+    BAD_TOKEN_PREFIX="rk_smkAudit"   # first 11 chars; what extract_prefix(...) returns
+    HTTP=$(curl -s -o /tmp/smoke_audit_bad.json -w "%{http_code}" \
+        -X POST "$API_URL/ingest" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $BAD_TOKEN" \
+        -d "{\"source\":\"smoke-audit-should-401\",\"text\":\"unused\"}")
+    if [[ "$HTTP" != "401" ]]; then
+        fail "Bogus-token /ingest expected 401, got $HTTP: $(cat /tmp/smoke_audit_bad.json)"
+    else
+        sleep 1
+        EVENT_LINE=$(docker compose logs api --tail 200 2>/dev/null \
+            | grep -F '"event_type":"auth.failure"' \
+            | grep -F "\"reason\":\"unknown_key\"" \
+            | grep -F "\"key_prefix\":\"$BAD_TOKEN_PREFIX\"" \
+            | tail -1)
+        if [[ -n "$EVENT_LINE" ]]; then
+            # Confirm the failed-attempt log does NOT contain the full
+            # bogus token — only the safe prefix. This is the redaction
+            # contract from the audit module's docstring.
+            if echo "$EVENT_LINE" | grep -qF "$BAD_TOKEN"; then
+                fail "Audit log leaked full bogus token (redaction broken)"
+            else
+                pass "Audit event 'auth.failure' (unknown_key) emitted with prefix only, no token leak"
+            fi
+        else
+            fail "Audit event 'auth.failure' / unknown_key not found in container logs (expected key_prefix=$BAD_TOKEN_PREFIX)"
+        fi
+    fi
+
+    # Cleanup: revoke the audit-test key.
+    docker compose exec -T api python -m scripts.issue_key \
+        --tenant "$AUDIT_TENANT" --revoke "$AUDIT_PREFIX" > /dev/null 2>&1
+fi
+
+# ----------------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------------
 echo "----------------------------------------"

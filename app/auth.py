@@ -44,6 +44,7 @@ from fastapi import Header, HTTPException, status
 from psycopg import OperationalError
 
 from app.db import get_conn
+from app.security import audit
 from app.security.keys import extract_prefix, hash_token
 
 
@@ -52,12 +53,13 @@ class TenantIdentity:
     """Resolved identity of the caller for the current request.
 
     Returned by `verify_api_key` for handlers that need to know WHO is
-    calling. Will feed Step 2 (per-key rate limiting) and Step 6
-    (audit log key/tenant tagging).
+    calling. Feeds Step 2 (per-key rate limiting) and Step 6 (audit log
+    key/tenant/request-id tagging).
     """
     key_id: int        # api_keys.id — stable PK for joins to audit_log
     tenant_id: str     # caller-facing identity, e.g. "acme-corp"
     key_prefix: str    # rk_<8 chars> — log-safe identifier of the key
+    request_id: str    # uuid4 hex — correlates every audit event from this request
 
 
 def _parse_bearer(authorization: str | None) -> str:
@@ -127,7 +129,24 @@ def verify_api_key(
         HTTPException 500: Postgres unreachable. Fail closed — we
             cannot authenticate anyone if the auth store is down.
     """
-    token = _parse_bearer(authorization)
+    # Phase 2 Step 6: mint the per-request correlation id at auth entry.
+    # Every audit event emitted while serving this request will carry it.
+    rid = audit.new_request_id()
+
+    # Header parsing can raise HTTPException (missing / malformed / bad scheme).
+    # Bucket those under one reason code — the SIEM can split on payload.detail
+    # if it cares about which sub-failure fired.
+    try:
+        token = _parse_bearer(authorization)
+    except HTTPException as exc:
+        audit.emit(
+            audit.EVT_AUTH_FAILURE,
+            request_id=rid,
+            reason="header_parse_failure",
+            detail=str(exc.detail),
+        )
+        raise
+
     digest = hash_token(token)
 
     try:
@@ -146,6 +165,12 @@ def verify_api_key(
     except OperationalError as e:
         # Database is down or unreachable. We cannot prove or disprove
         # the caller's identity, so we MUST refuse rather than guess.
+        audit.emit(
+            audit.EVT_AUTH_FAILURE,
+            request_id=rid,
+            reason="auth_store_down",
+            exc=e.__class__.__name__,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Auth store unavailable: {e.__class__.__name__}",
@@ -153,10 +178,16 @@ def verify_api_key(
 
     if row is None:
         # No row matched the digest. Either the token is bogus or
-        # was hashed differently. Log only the prefix of the attempt —
-        # never the full token — so a log leak doesn't compound
-        # the breach we're already investigating.
-        _ = extract_prefix(token)  # placeholder; Step 6 audit log will use this
+        # was hashed differently. We log the EXTRACTED PREFIX (rk_xxxx)
+        # of the attempted token — never the full token — so a log leak
+        # doesn't compound the breach we're already investigating.
+        attempted_prefix = extract_prefix(token)
+        audit.emit(
+            audit.EVT_AUTH_FAILURE,
+            key_prefix=attempted_prefix,
+            request_id=rid,
+            reason="unknown_key",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key.",
@@ -168,14 +199,32 @@ def verify_api_key(
     if revoked_at is not None:
         # Key was active at some point but has since been revoked.
         # Same generic 401 message as "unknown key" — see docstring.
+        # Audit log DOES distinguish the two (revoked_key vs unknown_key)
+        # because the threat models differ: revoked = credential rotation
+        # didn't propagate; unknown = brute-force or stale client.
+        audit.emit(
+            audit.EVT_AUTH_FAILURE,
+            key_prefix=key_prefix,
+            tenant=tenant_id,
+            request_id=rid,
+            reason="revoked_key",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Happy path: emit auth.success and return the identity carrying rid.
+    audit.emit(
+        audit.EVT_AUTH_SUCCESS,
+        key_prefix=key_prefix,
+        tenant=tenant_id,
+        request_id=rid,
+    )
     return TenantIdentity(
         key_id=key_id,
         tenant_id=tenant_id,
         key_prefix=key_prefix,
+        request_id=rid,
     )

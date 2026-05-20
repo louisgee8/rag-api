@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from fastapi import Depends, HTTPException, status
 
 from app.auth import TenantIdentity, verify_api_key
+from app.security import audit
 
 
 # --------------------------------------------------------------------------
@@ -228,5 +229,21 @@ def enforce_rate_limit(
     """
     # str() the key_id — dict keys are stringly typed so we never get
     # int/str collisions if the id type ever changes (e.g. UUIDs in Phase 3).
-    _limiter.check(str(identity.key_id))
+    try:
+        _limiter.check(str(identity.key_id))
+    except HTTPException as exc:
+        # Phase 2 Step 6: emit ratelimit.exceeded on the 429 path so the
+        # audit log carries abuse signals. Other HTTPExceptions (shouldn't
+        # happen here, but guard anyway) re-raise unaudited.
+        if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            audit.emit(
+                audit.EVT_RATELIMIT_EXCEEDED,
+                key_prefix=identity.key_prefix,
+                tenant=identity.tenant_id,
+                request_id=identity.request_id,
+                limit=_limiter.limit,
+                window_seconds=_limiter.window_seconds,
+                retry_after=int(exc.headers.get("Retry-After", "0")) if exc.headers else 0,
+            )
+        raise
     return identity
