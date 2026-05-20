@@ -528,6 +528,123 @@ PYEOF
 fi
 
 # ----------------------------------------------------------------------------
+# Tests 23-24 (Phase 2 Step 5): Relevance threshold gate on /query/answer.
+#
+# Same fresh-key discipline as the PII and injection blocks — $TOKEN was
+# revoked at Test 8 and reusing it would 401 at auth BEFORE the gate ever
+# evaluates retrieval results.
+#
+# Setup wrinkle: with only the Apollo 11 corpus in the DB, pgvector returns
+# exactly ONE chunk for any query and the gate fires `single_candidate` for
+# everything. To exercise the *gap-to-#2* path we have to ingest a second,
+# topically-distant doc so retrieval has two real candidates to separate.
+#
+# Test plan:
+#   23. POST /query/answer with a question topically far from BOTH corpora.
+#       Both docs end up similar-distance from the query (high distance,
+#       narrow gap), so the gate trips with reason=insufficient_gap and
+#       returns 422 BEFORE any Anthropic call.
+#   24. (Optional, SMOKE_TEST_ANTHROPIC=1) POST /query/answer with a
+#       question that DOES match one of the two corpora. The gap-to-#2 is
+#       wide, the gate passes, the LLM is called, expect 200. Confirms the
+#       gate does not false-positive on real matches.
+# ----------------------------------------------------------------------------
+RELEVANCE_TENANT="smoke-relevance"
+echo "----------------------------------------"
+echo "Minting fresh key for relevance-gate tests (tenant=$RELEVANCE_TENANT) ..."
+REL_ISSUE_OUTPUT=$(docker compose exec -T api python -m scripts.issue_key --tenant "$RELEVANCE_TENANT" 2>&1)
+if [[ $? -ne 0 ]]; then
+    fail "Could not mint relevance-test key: $REL_ISSUE_OUTPUT"
+else
+    REL_TOKEN=$(echo "$REL_ISSUE_OUTPUT" | grep -E '^[[:space:]]*token[[:space:]]*:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    REL_PREFIX=$(echo "$REL_ISSUE_OUTPUT" | grep -E '^[[:space:]]*key_prefix[[:space:]]*:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+
+    # Ingest a second, topically-unrelated doc so the gap-to-#2 path is
+    # reachable. We use a cooking topic; the Apollo doc and the cooking
+    # doc share almost no vocabulary, so embeddings sit far apart in
+    # cosine space.
+    RELEVANCE_SOURCE_2="smoke-cooking"
+    REL_TEXT_2="Sourdough bread is leavened by a culture of wild yeast and lactobacillus rather than commercial baker's yeast. The starter ferments flour and water for 12 to 24 hours before the dough is mixed."
+    HTTP=$(curl -s -o /tmp/smoke_rel_ingest.json -w "%{http_code}" \
+        -X POST "$API_URL/ingest" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $REL_TOKEN" \
+        -d "{\"source\":\"$RELEVANCE_SOURCE_2\",\"text\":\"$REL_TEXT_2\"}")
+    if [[ "$HTTP" != "200" ]]; then
+        fail "Setup: POST /ingest second corpus expected 200, got $HTTP: $(cat /tmp/smoke_rel_ingest.json)"
+    else
+        echo "  Second corpus ingested ($RELEVANCE_SOURCE_2)"
+
+        # Test 23: question topically distant from both corpora. Expect 422.
+        HTTP=$(curl -s -o /tmp/smoke_rel_low.json -w "%{http_code}" \
+            -X POST "$API_URL/query/answer" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $REL_TOKEN" \
+            -d '{"question":"What is the chemical formula of sulfuric acid?"}')
+        if [[ "$HTTP" != "422" ]]; then
+            fail "POST /query/answer (low confidence) expected 422, got $HTTP: $(cat /tmp/smoke_rel_low.json)"
+        else
+            BODY_CHECK=$(python3 - <<'PYEOF'
+import json, sys
+d = json.load(open('/tmp/smoke_rel_low.json'))
+detail = d.get('detail', {})
+if detail.get('error') != 'low_confidence':
+    print(f"WRONG_ERROR:{detail.get('error')}"); sys.exit()
+reason = detail.get('reason')
+if reason not in ('insufficient_gap', 'single_candidate', 'empty_result'):
+    print(f"WRONG_REASON:{reason}"); sys.exit()
+gap = detail.get('gap')
+thr = detail.get('threshold')
+print(f"OK reason={reason} gap={gap} threshold={thr}")
+PYEOF
+)
+            if [[ "$BODY_CHECK" == OK* ]]; then
+                pass "POST /query/answer (low-confidence query) → 422 ($BODY_CHECK)"
+            else
+                fail "POST /query/answer 422 body check failed: $BODY_CHECK"
+            fi
+        fi
+
+        # Test 24: question that hits one corpus strongly. Expect 200 if
+        # SMOKE_TEST_ANTHROPIC=1, otherwise just verify the gate doesn't
+        # trip (i.e. status is NOT 422; could be 200 or 502 depending on
+        # Anthropic availability — that's not what we're testing here).
+        if [[ "${SMOKE_TEST_ANTHROPIC:-0}" == "1" ]]; then
+            HTTP=$(curl -s -o /tmp/smoke_rel_hit.json -w "%{http_code}" \
+                -X POST "$API_URL/query/answer" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $REL_TOKEN" \
+                -d '{"question":"Who was the first person to walk on the Moon?"}')
+            if [[ "$HTTP" == "200" ]]; then
+                pass "POST /query/answer (high-confidence query, Anthropic on) → 200"
+            else
+                fail "POST /query/answer (high-confidence query) expected 200, got $HTTP: $(cat /tmp/smoke_rel_hit.json)"
+            fi
+        else
+            # Cheap negative check without burning Anthropic tokens: prove
+            # the gate doesn't trip on a strong match by hitting the route
+            # and confirming the status is NOT 422. Any other status (200
+            # if the env happens to have a working key, 502 if it doesn't)
+            # is fine — Step 5 only owns the 422 path.
+            HTTP=$(curl -s -o /tmp/smoke_rel_hit.json -w "%{http_code}" \
+                -X POST "$API_URL/query/answer" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $REL_TOKEN" \
+                -d '{"question":"Who was the first person to walk on the Moon?"}')
+            if [[ "$HTTP" != "422" ]]; then
+                pass "POST /query/answer (high-confidence query) → $HTTP, not 422 (gate let it through)"
+            else
+                fail "POST /query/answer (high-confidence query) wrongly tripped gate: $(cat /tmp/smoke_rel_hit.json)"
+            fi
+        fi
+    fi
+
+    # Cleanup: revoke the relevance-test key.
+    docker compose exec -T api python -m scripts.issue_key \
+        --tenant "$RELEVANCE_TENANT" --revoke "$REL_PREFIX" > /dev/null 2>&1
+fi
+
+# ----------------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------------
 echo "----------------------------------------"

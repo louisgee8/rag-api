@@ -24,12 +24,13 @@ from app import synthesis as synthesis_lib
 from app.security.injection import InjectionDetectedError, scan_or_raise as injection_scan_or_raise
 from app.security.pii import PIIDetectedError
 from app.security.ratelimit import enforce_rate_limit
+from app.security.relevance import LowConfidenceError, evaluate_or_raise as relevance_evaluate_or_raise
 
 
 app = FastAPI(
     title="rag-api",
-    description="Retrieval-Augmented Generation API. Phase 2 Step 4 — prompt injection defense (filter + fence).",
-    version="0.9.0",
+    description="Retrieval-Augmented Generation API. Phase 2 Step 5 — relevance threshold (gap-to-#2 gate on /query/answer).",
+    version="0.10.0",
 )
 
 
@@ -225,6 +226,7 @@ def query_answer_endpoint(payload: QueryRequest) -> QueryAnswerResponse:
     Failure modes mapped to HTTP:
     - prompt injection in question  -> 400 (Phase 2 Step 4 direct defense)
     - empty/invalid question        -> 400
+    - low retrieval confidence      -> 422 (Phase 2 Step 5 relevance gate)
     - Anthropic auth failure        -> 502 (upstream auth, not our auth)
     - Anthropic rate limit/timeout  -> 504
     - Other Anthropic API errors    -> 502
@@ -235,6 +237,14 @@ def query_answer_endpoint(payload: QueryRequest) -> QueryAnswerResponse:
     risk surface. Structural defense (fenced context + hardened system
     prompt) lives in app.synthesis and runs unconditionally on the chunks
     that make it past retrieval.
+
+    Phase 2 Step 5 (relevance threshold): after retrieval, checks the
+    cosine-distance gap between hit #1 and hit #2. If the gap is below
+    RELEVANCE_MIN_GAP, returns 422 {"error": "low_confidence", ...} and
+    never calls Anthropic. Cheap path for "you asked something the corpus
+    can't answer" — refuses to hallucinate instead of guessing. Only
+    enforced on /query/answer; /query/retrieve stays raw so clients can
+    still inspect low-confidence results to debug their corpus.
     """
     try:
         injection_scan_or_raise(payload.question)
@@ -251,6 +261,13 @@ def query_answer_endpoint(payload: QueryRequest) -> QueryAnswerResponse:
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # Phase 2 Step 5: relevance gate. Short-circuits BEFORE the Anthropic
+    # call so a low-confidence query doesn't burn tokens.
+    try:
+        relevance_evaluate_or_raise(chunks)
+    except LowConfidenceError as e:
+        raise HTTPException(status_code=422, detail=e.envelope)
 
     try:
         result = synthesis_lib.synthesize(

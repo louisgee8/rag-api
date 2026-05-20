@@ -57,6 +57,7 @@ services:
       CHUNK_OVERLAP: ${CHUNK_OVERLAP}
       RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS}
       RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS}
+      RELEVANCE_MIN_GAP: ${RELEVANCE_MIN_GAP}
     ports:
       - "8000:8000"   # host:container
     depends_on:

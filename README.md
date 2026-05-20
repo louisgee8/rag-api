@@ -21,6 +21,7 @@ Ingests documents (text or PDF), chunks and embeds them into a Postgres vector d
 | Rate limit | In-memory fixed-window counter, per `key_id`, env-tunable (default 60 req / 60 s) |
 | DLP | Hard-reject PII at `/ingest` (SSN / email / US phone / Luhn-valid credit card). NFKC-normalized to defeat Unicode + whitespace + underscore obfuscation. |
 | Prompt injection | Layered defense: regex blocklist on input (direct + indirect), per-request random fence tokens around retrieved chunks, hardened system prompt labeling fenced content as data not instructions |
+| Relevance gate | Gap-to-#2 cosine-distance threshold on `/query/answer`. Low-confidence retrievals return `HTTP 422 low_confidence` BEFORE the Anthropic call — refuses to hallucinate when the corpus can't answer. |
 
 ## Quick start
 
@@ -84,6 +85,31 @@ SMOKE_TEST_ANTHROPIC=1 ./tests/smoke.sh
 The script is idempotent. It uses a fixed source name (`smoke-test-fixture`) and the API's DELETE-by-source re-ingest semantics, so re-running does not pollute the documents table.
 
 ## Security posture
+
+### Phase 2 Step 5 — Relevance threshold (Sec+ domain: Availability, Integrity / anti-hallucination) (this release)
+
+Defends against the "confidently wrong" failure mode where the retriever returns *something* for any query, the LLM dutifully synthesizes an answer, and the user has no signal that the corpus didn't actually have the answer. Cheaper to refuse than to spend the Anthropic call and ship a hallucination.
+
+- **Metric — gap-to-#2.** After pgvector returns the top-K cosine-distance results, compute `gap = chunks[1].distance - chunks[0].distance`. A positive gap means hit #1 is *meaningfully* closer to the question than hit #2. A near-zero gap means everything in the corpus is roughly equidistant from the question — i.e. the question isn't grounded by any specific chunk. Scale-invariant: works across corpora without per-domain re-tuning, unlike a fixed absolute-distance cutoff.
+- **Threshold.** `RELEVANCE_MIN_GAP` env var, default `0.05`. Calibrated from Phase 1: absent-from-corpus content gives gap ~0.01, the project's own smoke fixture matches with gap 0.2039, strong real matches show 0.55+. Default of 0.05 blocks the absent case and lets every real query through.
+- **Edge cases — empty result and single candidate.** Zero chunks (empty DB / wiped table) or one chunk (corpus has <2 documents) both fail the gate — you cannot evaluate *separation* with one data point. Returned as distinct `reason` codes (`empty_result`, `single_candidate`, `insufficient_gap`) so the caller can distinguish "no corpus" from "weak match."
+- **Where it fires — `/query/answer` only.** `/query/retrieve` deliberately stays raw so clients can inspect low-confidence results to debug their corpus or build their own composition layer. The gate runs AFTER retrieval but BEFORE synthesis, so a low-confidence query costs the embed + ANN lookup (cheap) but never the LLM call (expensive).
+- **Lives in `app/security/relevance.py`.** Public surface: `LowConfidenceError` exception with an `.envelope` property + `evaluate_or_raise(chunks)` function. Stdlib only, duck-typed on `.distance`, no circular imports with `app.retrieval`.
+
+**Rejection contract:** `HTTP 422` with body
+```json
+{"detail": {"error": "low_confidence", "reason": "insufficient_gap",
+            "chunks_returned": 5, "top_distance": 0.84, "gap": 0.01,
+            "threshold": 0.05}}
+```
+
+**Why 422 instead of 400 or 404:** the request itself is well-formed (400 doesn't fit), the resource exists (404 doesn't fit), but the *retrieved data is semantically insufficient* to honor it. 422 Unprocessable Entity is RFC 9110's exact name for "request was understood but the contents don't let me proceed."
+
+**Known limitations (intentional, documented):**
+
+1. **Single-corpus calibration.** Threshold of 0.05 was calibrated against the project's MiniLM-L6-v2 embeddings on a small fixture set. Production corpora with different domains or different embedding models may need tuning. The env var makes this a config change, not a code change.
+2. **Two-hit minimum.** A corpus with only one document fails the gate for every query, even if that document is a perfect match. Acceptable for portfolio scope (a one-doc RAG isn't a RAG); production should consider a fallback "absolute distance" check for the single-candidate path.
+3. **Gap-to-#2 doesn't catch "wrong-but-confident" retrievals.** If the corpus contains five chunks all about topic A and the user asks about topic B, the top hit may still beat hit #2 by a wide margin while being wrong. This is a retrieval-side problem the gate can't see; would need synthesis-side or re-ranking defenses to catch.
 
 ### Phase 2 Step 4 — Prompt injection defense (Sec+ domain: Threats / Input validation, Architecture / Defense in depth)
 
@@ -173,8 +199,8 @@ Lives inline in `app/security/pii.py`. Spans in returned `PIIHit` objects refere
 - [x] **Step 2**: Per-key rate limiting.
 - [x] **Step 3**: PII hard-reject on `/ingest`.
 - [x] **Step 3.5** (hotfix): NFKC normalization closing 6 of 7 PII bypasses.
-- [x] **Step 4**: Prompt injection defense (filter + structural fence + indirect coverage) (this release).
-- [ ] Step 5: Relevance threshold for "I don't know" responses.
+- [x] **Step 4**: Prompt injection defense (filter + structural fence + indirect coverage).
+- [x] **Step 5**: Relevance threshold (gap-to-#2 gate on `/query/answer`) (this release).
 - [ ] Step 6: Structured audit logging.
 - [ ] Step 7: CI/CD via GitHub Actions.
 
