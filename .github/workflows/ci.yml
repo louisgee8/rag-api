@@ -1,0 +1,93 @@
+# ============================================================
+# rag-api CI — GitHub Actions
+# ============================================================
+# Phase 2 Step 7. Triggers:
+#   - Every push to main:  lint → build
+#   - Every PR to main:    lint → build
+#
+# What this CI enforces:
+#   - lint  : ruff against app/ scripts/ tests/*.py (config: ruff.toml)
+#   - build : docker build of the app image (catches Dockerfile /
+#             requirements.txt regressions before they hit a dev's machine)
+#
+# What it does NOT enforce (deferred to Phase 3):
+#   - smoke.sh against a live URL. Needs Postgres+pgvector service
+#     container + a mocked-or-real Anthropic call. Will be wired in
+#     Phase 3 alongside cloud deploy (Fly.io), matching NextSound's
+#     test → build → deploy → smoke pipeline.
+#
+# Why two jobs instead of one:
+#   - GitHub parallelizes them. Lint is ~5s, build is ~60s. Running in
+#     parallel surfaces lint failures faster (fail-fast feedback).
+#   - The UI marks which stage failed without grepping logs.
+#
+# Mirrors NextSound CI structure minus the deploy/smoke legs.
+# ============================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on the same branch when a newer push lands.
+# Saves Actions minutes on rapid-fire commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------
+  # Lint: ruff against the Python code paths.
+  # Config lives in ruff.toml at repo root (target-version,
+  # line-length, rule selection, isort options).
+  # --------------------------------------------------------
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # Built-in pip cache keyed on requirements.txt. Speeds up
+          # repeated runs even though we only install ruff here.
+          cache: pip
+
+      - name: Install ruff
+        # Pinned to keep CI deterministic. Bump intentionally, not by
+        # accident. Same version philosophy as requirements.txt.
+        run: pip install ruff==0.15.13
+
+      - name: Run ruff
+        # Same target paths as the local invocation in ruff.toml.
+        # `--output-format=github` annotates failures inline on the
+        # PR diff view, which is the whole UX win for hosted CI.
+        run: ruff check app/ scripts/ tests/make_fixture_pdf.py --output-format=github
+
+  # --------------------------------------------------------
+  # Build: ensure the app Dockerfile builds cleanly.
+  # We don't push the image anywhere — this is a "does it
+  # assemble" floor, not a registry push.
+  # --------------------------------------------------------
+  build:
+    name: Build (Docker app image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        # Buildx enables BuildKit features the Dockerfile already uses
+        # (cache mounts via `# syntax=docker/dockerfile:1.7` directive).
+        # Without Buildx, those mount lines are ignored and pip reinstalls
+        # every layer.
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build app image
+        # Local tag only — no `docker push`. CI's job is to verify the
+        # Dockerfile and requirements.txt are coherent.
+        run: docker build -f Dockerfile -t rag-api:ci .

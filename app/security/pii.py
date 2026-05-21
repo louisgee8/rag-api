@@ -83,7 +83,6 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Iterable
 
-
 # ---------------------------------------------------------------------------
 # Pattern set. Compiled at module load (one-time cost, zero per-request cost).
 # Word boundaries (`\b`) guard against mid-token matches.

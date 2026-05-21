@@ -18,9 +18,7 @@ import anthropic
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from app import ingest as ingest_lib
-from app import retrieval as retrieval_lib
-from app import synthesis as synthesis_lib
+from app import ingest as ingest_lib, retrieval as retrieval_lib, synthesis as synthesis_lib
 from app.auth import TenantIdentity
 from app.security import audit
 from app.security.injection import InjectionDetectedError, scan_or_raise as injection_scan_or_raise
@@ -28,10 +26,13 @@ from app.security.pii import PIIDetectedError
 from app.security.ratelimit import enforce_rate_limit
 from app.security.relevance import LowConfidenceError, evaluate_or_raise as relevance_evaluate_or_raise
 
-
 app = FastAPI(
     title="rag-api",
-    description="Retrieval-Augmented Generation API. Phase 2 Step 6 — structured audit logging (JSONL on stdout for every security-relevant event).",
+    description=(
+        "Retrieval-Augmented Generation API. "
+        "Phase 2 Step 6 — structured audit logging "
+        "(JSONL on stdout for every security-relevant event)."
+    ),
     version="0.11.0",
 )
 

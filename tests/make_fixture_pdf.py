@@ -14,8 +14,8 @@ produces multiple chunks (proves chunk_index increments correctly).
 """
 
 from pathlib import Path
-from fpdf import FPDF
 
+from fpdf import FPDF
 
 SECPLUS_TEXT = """\
 CompTIA Security Plus Study Notes (Test Fixture)

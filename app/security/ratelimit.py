@@ -59,7 +59,6 @@ from fastapi import Depends, HTTPException, status
 from app.auth import TenantIdentity, verify_api_key
 from app.security import audit
 
-
 # --------------------------------------------------------------------------
 # Config (env-driven, 12-factor — same pattern as RAG_API_KEY in Phase 1)
 # --------------------------------------------------------------------------

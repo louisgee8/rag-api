@@ -55,7 +55,6 @@ import anthropic
 from app.retrieval import RetrievedChunk
 from app.security.injection import context_instruction, make_fence_token
 
-
 # --- Prompt template ------------------------------------------------------
 
 _SYSTEM_PROMPT_BASE = (

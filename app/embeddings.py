@@ -21,7 +21,6 @@ from typing import Sequence
 
 from sentence_transformers import SentenceTransformer
 
-
 # Module-level singleton. None until first get_model() call.
 _model: SentenceTransformer | None = None
 

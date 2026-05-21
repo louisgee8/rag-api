@@ -2,7 +2,7 @@
 
 A Retrieval-Augmented Generation (RAG) API built with FastAPI, Postgres + pgvector, sentence-transformers, and Anthropic's Claude.
 
-**Status:** Phase 2 Step 6 shipped — structured audit logging. Every security-relevant event (auth success/failure, rate-limit exceeded, PII detected, injection detected, low-confidence retrieval, ingest success, query.answer success) is emitted as one JSON line on the api container's stdout, correlated across one request by a uuid4 `request_id`. Earlier layers: relevance threshold (Step 5), prompt injection defense (Step 4), NFKC normalization (Step 3.5), PII hard-reject (Step 3), per-key rate limiting (Step 2), per-tenant API keys (Step 1).
+**Status:** Phase 2 COMPLETE — Step 7 shipped (CI/CD via GitHub Actions). Every push and PR to `main` runs a two-job pipeline: `ruff` lints `app/ scripts/ tests/*.py`, and `docker build` verifies the app image assembles cleanly. Earlier layers: structured audit logging (Step 6), relevance threshold (Step 5), prompt injection defense (Step 4), NFKC normalization (Step 3.5), PII hard-reject (Step 3), per-key rate limiting (Step 2), per-tenant API keys (Step 1).
 
 ## What it does
 
@@ -23,6 +23,7 @@ Ingests documents (text or PDF), chunks and embeds them into a Postgres vector d
 | Prompt injection | Layered defense: regex blocklist on input (direct + indirect), per-request random fence tokens around retrieved chunks, hardened system prompt labeling fenced content as data not instructions |
 | Relevance gate | Gap-to-#2 cosine-distance threshold on `/query/answer`. Low-confidence retrievals return `HTTP 422 low_confidence` BEFORE the Anthropic call — refuses to hallucinate when the corpus can't answer. |
 | Audit log | Structured JSONL on stdout. Uniform envelope (`ts`, `event_type`, `key_prefix`, `tenant`, `request_id`, `payload`) across 8 event types. Append-only, log-driver rotated, SIEM-ready. Caller-side redaction discipline: identifiers in, secrets out. |
+| CI/CD | GitHub Actions on every push + PR to `main`. Two jobs run in parallel: `ruff` lint on `app/ scripts/ tests/*.py` (config in `ruff.toml`), and `docker build` of the app image (verifies Dockerfile + requirements.txt). Concurrency cancel on rapid-fire commits. Smoke-against-live-URL deferred to Phase 3 alongside cloud deploy. |
 
 ## Quick start
 
@@ -87,7 +88,33 @@ The script is idempotent. It uses a fixed source name (`smoke-test-fixture`) and
 
 ## Security posture
 
-### Phase 2 Step 6 — Structured audit logging (Sec+ domain: Audit & Accountability, Incident Response) (this release)
+### Phase 2 Step 7 — CI/CD (Sec+ domain: Secure SDLC, Supply chain integrity) (this release)
+
+Establishes a readiness floor that every change to `main` must clear before it can ship. The pipeline lives in `.github/workflows/ci.yml`, ruff config in `ruff.toml`. Triggered on every `push` to `main` and every `pull_request` against `main`.
+
+- **Two parallel jobs — `lint` and `build`.** GitHub runs them concurrently. Lint fails fast (~5s) when there's a typo, an unused import, or a name that doesn't resolve. Build (~60s) ensures the Dockerfile + `requirements.txt` produce a coherent image. Splitting them means the UI marks which floor failed without grepping logs.
+- **Lint floor — `ruff` (pyflakes + pycodestyle + isort).** Config selects `E F W I` only. We intentionally skip opinionated style packs (`B`, `C4`, `SIM`, etc.) — Step 7 is about establishing a readiness floor, not retrofitting style preferences onto a working codebase. `combine-as-imports = true` preserves the existing `from X import A, B as alias` style instead of splitting it across two lines for ~10 import blocks.
+- **Build floor — `docker build` of the app image.** No `docker push` to a registry; this is a "does it assemble" check. Uses `docker/setup-buildx-action@v3` because the Dockerfile declares `# syntax=docker/dockerfile:1.7` and uses `--mount=type=cache,target=/root/.cache/pip` — without Buildx, that cache mount is silently ignored and pip reinstalls every wheel on every run.
+- **Concurrency cancel.** `concurrency: { group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }` — if you push three commits in 90 seconds, only the latest is built. Saves Actions minutes and avoids the "older job finishes second and overwrites newer state" race that bit NextSound's first CI iteration.
+- **Pinned ruff version.** `pip install ruff==0.15.13` — CI behavior should change because we bumped the pin intentionally, not because a transitive auto-upgraded overnight. Same discipline as the pinned versions in `requirements.txt`.
+
+**What this CI catches:**
+
+- Undefined names (`F821` — renamed function with dead call sites)
+- Unused imports (`F401` — dead code in a security module)
+- Syntax errors and bad indentation (`E`-series)
+- Failed `pip install` from a typo'd version pin or yanked package
+- Missing system deps in the Dockerfile that break the wheel-build step
+- Broken `COPY` paths that would fail in production rebuild
+
+**What this CI does NOT catch (deferred to Phase 3):**
+
+1. **Runtime behavior regressions.** A regex change that quietly stops catching SSNs ending in `0000` is syntactically valid and the image builds — only a live smoke test catches it. The 25-test `tests/smoke.sh` will be wired in Phase 3 as a `smoke` job that runs against the deployed Fly.io URL, matching NextSound's `test → build → deploy → smoke` pattern.
+2. **Static type checking.** No `mypy` in CI yet. The Phase 1/2 code uses type hints inconsistently, so adding `mypy --strict` would surface ~20-50 errors that aren't bugs, just missing annotations. Deferred until either (a) we have time to annotate properly or (b) we adopt `mypy` in less-strict mode.
+3. **Dependency vulnerability scanning.** No `pip-audit` / `safety` / Dependabot rule yet. Phase 3 will add a third job or enable GitHub's built-in Dependabot for `pip` and `github-actions` ecosystems.
+4. **Container scanning.** No Trivy / Grype scan of the built image. Same Phase 3 add — fits naturally alongside the `build` job (scan the image we just built before discarding it).
+
+### Phase 2 Step 6 — Structured audit logging (Sec+ domain: Audit & Accountability, Incident Response)
 
 Every security-relevant action through the API leaves a structured, machine-parseable trail. Designed so a future investigator (or SIEM) can reconstruct a single request's full event sequence from any one event, without parsing freeform log strings.
 
@@ -228,8 +255,10 @@ Lives inline in `app/security/pii.py`. Spans in returned `PIIHit` objects refere
 - [x] **Step 3.5** (hotfix): NFKC normalization closing 6 of 7 PII bypasses.
 - [x] **Step 4**: Prompt injection defense (filter + structural fence + indirect coverage).
 - [x] **Step 5**: Relevance threshold (gap-to-#2 gate on `/query/answer`).
-- [x] **Step 6**: Structured audit logging (JSONL on stdout, 8 event types, correlated by `request_id`) (this release).
-- [ ] Step 7: CI/CD via GitHub Actions.
+- [x] **Step 6**: Structured audit logging (JSONL on stdout, 8 event types, correlated by `request_id`).
+- [x] **Step 7**: CI/CD via GitHub Actions (ruff lint + docker build floor on every push/PR) (this release).
+
+**Phase 2 complete.** Next: Phase 3 — cloud deploy (Fly.io), smoke-against-live-URL in CI, Dependabot/container scanning.
 
 ## License
 

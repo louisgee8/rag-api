@@ -1,0 +1,38 @@
+# ============================================================
+# rag-api ruff config — Phase 2 Step 7
+# ============================================================
+# Lint floor enforced by CI. See .github/workflows/ci.yml.
+#
+# Scope: app/ scripts/ tests/*.py
+# Out of scope: migrations/ (SQL), tests/fixtures/ (generated),
+#               tests/smoke.sh (shell, not Python)
+#
+# Rule selection rationale:
+#   E  — pycodestyle errors (syntax-adjacent: bad indentation, etc.)
+#   F  — pyflakes (undefined names, unused imports, real bugs)
+#   W  — pycodestyle warnings (trailing whitespace, etc.)
+#   I  — isort (consistent import ordering)
+# We intentionally skip opinionated style packs (B, C4, SIM, etc.) for
+# Phase 2. Step 7 is about establishing a readiness floor, not retrofitting
+# style preferences across a working codebase. Tighten later if needed.
+# ============================================================
+
+target-version = "py311"  # matches Dockerfile: FROM python:3.11-slim
+line-length = 120
+
+# Exclude generated / non-Python paths from lint.
+extend-exclude = [
+    "migrations",
+    "tests/fixtures",
+    ".venv",
+    "venv",
+]
+
+[lint]
+select = ["E", "F", "W", "I"]
+
+[lint.isort]
+# Keep `from X import A, B as alias` on one line instead of splitting into
+# two `from X import ...` statements. Matches the existing codebase style;
+# splitting would churn ~10 import blocks for zero readability win.
+combine-as-imports = true

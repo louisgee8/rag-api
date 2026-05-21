@@ -27,7 +27,6 @@ from app.embeddings import encode
 from app.security.injection import scan_or_raise as injection_scan_or_raise
 from app.security.pii import scan_or_raise as pii_scan_or_raise
 
-
 # Sec+: allowlist by MIME type, never trust extensions. .pdf.exe would slip a
 # blocklist. In production, sniff magic bytes via libmagic for true defense.
 ALLOWED_MIMES = {"text/plain", "application/pdf"}

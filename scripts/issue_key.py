@@ -56,7 +56,7 @@ def issue(tenant_id: str) -> None:
     key_id, created_at = row
     # Loud, copy-friendly output. Cleartext appears ONCE — capture it now.
     print("=" * 60)
-    print(f"  NEW API KEY ISSUED — copy this token NOW, it cannot be recovered.")
+    print("  NEW API KEY ISSUED — copy this token NOW, it cannot be recovered.")
     print("=" * 60)
     print(f"  tenant_id  : {tenant_id}")
     print(f"  key_id     : {key_id}")

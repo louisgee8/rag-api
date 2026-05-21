@@ -65,7 +65,6 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Iterable
 
-
 # ---------------------------------------------------------------------------
 # Pattern set. Each regex is verbose-mode for readability and uses
 # re.IGNORECASE because attackers don't care about capitalization.

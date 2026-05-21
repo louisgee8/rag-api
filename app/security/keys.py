@@ -36,7 +36,6 @@ import hashlib
 import secrets
 from dataclasses import dataclass
 
-
 # Brand prefix. Visible in cleartext tokens. Lets secret scanners
 # (GitHub, TruffleHog, gitleaks) match on a known shape, the same way
 # `ghp_` flags a GitHub PAT and `AKIA` flags an AWS access key.
