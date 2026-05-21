@@ -35,3 +35,4 @@ postgres_data/
 
 # --- Test fixtures (generated artifacts) ---
 tests/fixtures/
+.ruff_cache/
